@@ -1,4 +1,5 @@
 #include "config.h"
+#include "stepCounter.h"
 
 // Check if Bluetooth configs are enabled
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
@@ -39,6 +40,8 @@ void initHikeWatch()
     // Enable BMA423 step count feature
     // Reset steps
     // Turn on step interrupt
+    // Initialize step counter
+    initStepCounter();
 
     // Side button
     pinMode(AXP202_INT, INPUT_PULLUP);
@@ -257,6 +260,45 @@ void loop()
         updateTimeout = 0;
 
         //reset step-counter
+        // Step counter and session loop
+        uint32_t stepCount = 0;
+        while (state == 3) {
+            // Handle BMA423 step interrupt
+            if (irqBMA) {
+                irqBMA = false;
+                bool rlst;
+                do {
+                    rlst = sensor->readInterrupt();
+                } while (!rlst);
+
+                // Check if it is a step interrupt
+                if (sensor->isStepCounter()) {
+                    stepCount = sensor->getCounter();
+                    // Update step display
+                    watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
+                    watch->tft->setCursor(45, 70);
+                    watch->tft->print("Steps: ");
+                    watch->tft->print(stepCount);
+                    watch->tft->print("   ");
+                    Serial.println(stepCount);
+                }
+            }
+
+            // Handle button press to end session
+            if (irqButton) {
+                irqButton = false;
+                watch->power->readIRQ();
+                // Save session data
+                saveIdToFile(sessionId);
+                saveStepsToFile(stepCount);
+                saveDistanceToFile(0.0);  // TODO: Calculate distance from steps
+                sessionStored = true;
+                state = 4;
+                watch->power->clearIRQ();
+                break;
+            }
+            delay(20);
+        }
     }
     case 4:
     {
