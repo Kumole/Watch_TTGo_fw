@@ -54,6 +54,12 @@
 // Step counter reference (steps per km) - adjust based on calibration
 #define STEPS_PER_KM        1300
 
+
+
+
+
+
+
 // Global step counter state
 extern uint32_t currentStepCount;
 extern volatile bool stepInterruptFlag;
