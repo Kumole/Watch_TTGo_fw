@@ -23,6 +23,10 @@ volatile bool irqButton = false;
 bool sessionStored = false;
 bool sessionSent = false;
 
+int currentSessionIdx = 0;
+int storedSessionCount = 0;
+const int MAX_SESSIONS = 10;
+
 // Timer variables
 unsigned long last = 0;
 unsigned long updateTimeout = 0;
@@ -71,54 +75,62 @@ void sendDataBT(fs::FS &fs, const char * path)
     file.close();
 }
 
-void sendSessionBT()
-{
-    // Read session and send it via SerialBT
-    watch->tft->fillRect(0, 0, 240, 240, TFT_BLACK);
-    watch->tft->drawString("Sending session", 20, 80);
-    watch->tft->drawString("to Hub", 80, 110);
+void updateSessionCount() {
+    storedSessionCount = 0;
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        char path[20];
+        sprintf(path, "/id_%d.txt", i);
+        if (LittleFS.exists(path)) {
+            storedSessionCount++;
+        }
+    }
+}
 
-    // Sending session id
-    sendDataBT(LittleFS, "/id.txt");
-    SerialBT.write(';');
-    // Sending steps
-    sendDataBT(LittleFS, "/steps.txt");
-    SerialBT.write(';');
-    // Sending distance
-    sendDataBT(LittleFS, "/distance.txt");
-    SerialBT.write(';');
-    // Send connection termination char
-    SerialBT.write('\n');
+void sendSessionBT() {
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        char path[20];
+        sprintf(path, "/id_%d.txt", i);
+        
+        if (LittleFS.exists(path)) {
+            sendDataBT(LittleFS, path); // ID
+            SerialBT.write(';');
+            
+            sprintf(path, "/steps_%d.txt", i);
+            sendDataBT(LittleFS, path);
+            SerialBT.write(';');
+            
+            sprintf(path, "/dist_%d.txt", i);
+            sendDataBT(LittleFS, path);
+            SerialBT.write(';');
+            
+            SerialBT.write('\n'); // One line per session for the RPi to parse
+        }
+    }
 }
 
 
-void saveIdToFile(uint16_t id)
-{
-    char buffer[10];
-    itoa(id, buffer, 10);
-    writeFile(LittleFS, "/id.txt", buffer);
+void saveSessionData(int idx, uint16_t id, uint32_t steps, float distance) {
+    char path[20];
+    
+    sprintf(path, "/id_%d.txt", idx);
+    writeFile(LittleFS, path, String(id).c_str());
+    
+    sprintf(path, "/steps_%d.txt", idx);
+    writeFile(LittleFS, path, String(steps).c_str());
+    
+    sprintf(path, "/dist_%d.txt", idx);
+    writeFile(LittleFS, path, String(distance).c_str());
 }
 
-void saveStepsToFile(uint32_t step_count)
-{
-    char buffer[10];
-    itoa(step_count, buffer, 10);
-    writeFile(LittleFS, "/steps.txt", buffer);
-}
-
-void saveDistanceToFile(float distance)
-{
-    char buffer[10];
-    itoa(distance, buffer, 10);
-    writeFile(LittleFS, "/distance.txt", buffer);
-}
-
-void deleteSession()
-{
-    deleteFile(LittleFS, "/id.txt");
-    deleteFile(LittleFS, "/distance.txt");
-    deleteFile(LittleFS, "/steps.txt");
-    deleteFile(LittleFS, "/coord.txt");
+void deleteSession() {
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        char path[20];
+        sprintf(path, "/id_%d.txt", i); LittleFS.remove(path);
+        sprintf(path, "/steps_%d.txt", i); LittleFS.remove(path);
+        sprintf(path, "/dist_%d.txt", i); LittleFS.remove(path);
+    }
+    storedSessionCount = 0; // Reset counter
+    Serial.println("Memory cleared. Ready for new sessions.");
 }
 
 void setup()
@@ -133,7 +145,7 @@ void setup()
     sensor = watch->bma;
     
     initHikeWatch();
-
+    updateSessionCount();
     state = 1;
 
     SerialBT.begin("Hiking Watch");
@@ -213,23 +225,29 @@ void loop()
 
             /*      IRQ     */
             if (irqButton) {
-                irqButton = false;
-                watch->power->readIRQ();
-                if (state == 1)
-                {
-                    state = 2;
-                }
-                watch->power->clearIRQ();
-            }
-            if (state == 2) {
-                if (sessionStored)
-                {
-                    watch->tft->fillRect(0, 0, 240, 240, TFT_BLACK);
-                    watch->tft->drawString("Overwriting",  55, 100, 4);
-                    watch->tft->drawString("session", 70, 130);
-                    delay(1000);
-                }
+            irqButton = false;
+            watch->power->readIRQ();
+            
+            // CHECK THE LIMIT BEFORE STARTING
+            updateSessionCount(); 
+
+            if (storedSessionCount >= MAX_SESSIONS) {
+                // WARNING UI
+                watch->tft->fillScreen(TFT_RED);
+                watch->tft->setTextColor(TFT_WHITE);
+                watch->tft->drawString("MEMORY FULL!", 45, 80, 4);
+                watch->tft->drawString("Sync with RPi", 45, 110);
+                watch->tft->drawString("to clear space", 35, 140);
+                delay(3000); // Show warning for 3 seconds
+                
+                // Redraw original screen
+                state = 1; 
+                break; // Exit while to refresh UI
+            } else {
+                state = 2; // Allow starting the hike
                 break;
+            }
+            watch->power->clearIRQ();
             }
         }
         break;
@@ -244,7 +262,6 @@ void loop()
     case 3:
     {
         /* Hiking session ongoing */
-
         watch->tft->fillRect(0, 0, 240, 240, TFT_BLACK);
         watch->tft->drawString("Starting hike", 45, 100);
         delay(1000);
@@ -256,49 +273,51 @@ void loop()
         watch->tft->setCursor(45, 100);
         watch->tft->print("Dist: 0 km");
 
-        last = millis();
-        updateTimeout = 0;
-
-        //reset step-counter
-        // Step counter and session loop
         uint32_t stepCount = 0;
+        
+        // Ensure IRQ is clean before starting the loop
+        watch->power->readIRQ();
+        watch->power->clearIRQ();
+        irqButton = false; 
+
         while (state == 3) {
-            // Handle BMA423 step interrupt
+            // Handle Step Interrupt
             if (irqBMA) {
                 irqBMA = false;
-                bool rlst;
-                do {
-                    rlst = sensor->readInterrupt();
-                } while (!rlst);
-
-                // Check if it is a step interrupt
-                if (sensor->isStepCounter()) {
+                if (sensor->readInterrupt() && sensor->isStepCounter()) {
                     stepCount = sensor->getCounter();
-                    // Update step display
                     watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
-                    watch->tft->setCursor(45, 70);
-                    watch->tft->print("Steps: ");
+                    watch->tft->setCursor(120, 70); // Update just the number
                     watch->tft->print(stepCount);
                     watch->tft->print("   ");
-                    Serial.println(stepCount);
                 }
             }
 
-            // Handle button press to end session
+            // Handle Button Press to END session
             if (irqButton) {
                 irqButton = false;
                 watch->power->readIRQ();
-                // Save session data
-                saveIdToFile(sessionId);
-                saveStepsToFile(stepCount);
-                saveDistanceToFile(0.0);  // TODO: Calculate distance from steps
-                sessionStored = true;
-                state = 4;
+                
+                // Only act if it was a short press
+                if (watch->power->isPEKShortPressIRQ()) {
+                    // 1. Save using the current index
+                    saveSessionData(currentSessionIdx, sessionId, stepCount, 0.0);
+                    
+                    // 2. Increment index for NEXT time (FIFO)
+                    currentSessionIdx++;
+                    if (currentSessionIdx >= MAX_SESSIONS) currentSessionIdx = 0;
+                    
+                    // 3. Update the total count for Case 1 guard
+                    updateSessionCount();
+                    
+                    sessionStored = true;
+                    state = 4; // Move to save/exit state
+                }
                 watch->power->clearIRQ();
-                break;
             }
-            delay(20);
+            delay(50); // Small delay to prevent CPU hogging
         }
+        break; 
     }
     case 4:
     {
