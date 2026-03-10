@@ -25,7 +25,7 @@ bool sessionSent = false;
 
 int currentSessionIdx = 0;
 int storedSessionCount = 0;
-const int MAX_SESSIONS = 10;
+const int MAX_SESSIONS = 5;
 
 // Timer variables
 unsigned long last = 0;
@@ -123,14 +123,23 @@ void saveSessionData(int idx, uint16_t id, uint32_t steps, float distance) {
 }
 
 void deleteSession() {
+    Serial.println("Deleting all sessions...");
     for (int i = 0; i < MAX_SESSIONS; i++) {
         char path[20];
         sprintf(path, "/id_%d.txt", i); LittleFS.remove(path);
         sprintf(path, "/steps_%d.txt", i); LittleFS.remove(path);
         sprintf(path, "/dist_%d.txt", i); LittleFS.remove(path);
     }
-    storedSessionCount = 0; // Reset counter
-    Serial.println("Memory cleared. Ready for new sessions.");
+    
+    // Force reset variables
+    storedSessionCount = 0; 
+    currentSessionIdx = 0;
+    sessionStored = false;
+    sessionSent = false;
+
+    updateSessionCount();
+    Serial.print("Verification - Stored sessions: ");
+    Serial.println(storedSessionCount);
 }
 
 void setup()
@@ -156,103 +165,82 @@ void loop()
     switch (state)
     {
     case 1:
+{
+    /* Initial stage */
+    updateSessionCount(); 
+    
+    // Clear hardware interrupt state before entering the loop
+    watch->power->readIRQ();
+    watch->power->clearIRQ();
+    irqButton = false;
+
+    // Draw your original Start Screen
+    watch->tft->fillScreen(TFT_BLACK);
+    watch->tft->setTextFont(4);
+    watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
+    watch->tft->drawString("Hiking Watch", 45, 25, 4);
+    watch->tft->drawString("Press button", 50, 80);
+    watch->tft->drawString("to start session", 40, 110);
+
+    bool exitSync = false;
+
+    while (!exitSync) 
     {
-        /* Initial stage */
-        //Basic interface
-        watch->tft->fillScreen(TFT_BLACK);
-        watch->tft->setTextFont(4);
-        watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
-        watch->tft->drawString("Hiking Watch",  45, 25, 4);
-        watch->tft->drawString("Press button", 50, 80);
-        watch->tft->drawString("to start session", 40, 110);
-
-        bool exitSync = false;
-
-        //Bluetooth discovery
-        while (1)
+        /* Bluetooth sync */
+        if (SerialBT.available())
         {
-            /* Bluetooth sync */
-            if (SerialBT.available())
+            char incomingChar = SerialBT.read();
+            // Use sessionStored to allow sync only if there is data
+            if (incomingChar == 'c' && sessionStored && !sessionSent)
             {
-                char incomingChar = SerialBT.read();
-                if (incomingChar == 'c' and sessionStored and not sessionSent)
-                {
-                    sendSessionBT();
-                    sessionSent = true;
-                }
-                
-
-                if (sessionSent && sessionStored) {
-                    // Update timeout before blocking while
-                    updateTimeout = 0;
-                    last = millis();
-                    while(1)
-                    {
-                        updateTimeout = millis();
-
-                        if (SerialBT.available())
-                            incomingChar = SerialBT.read();
-                        if (incomingChar == 'r')
-                        {
-                            Serial.println("Got an R");
-                            // Delete session
-                            deleteSession();
-                            sessionStored = false;
-                            sessionSent = false;
-                            incomingChar = 'q';
-                            exitSync = true;
-                            break;
-                        }
-                        else if ((millis() - updateTimeout > 2000))
-                        {
-                            Serial.println("Waiting for timeout to expire");
-                            updateTimeout = millis();
-                            sessionSent = false;
-                            exitSync = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (exitSync)
-            {
-                delay(1000);
-                watch->tft->fillRect(0, 0, 240, 240, TFT_BLACK);
-                watch->tft->drawString("Hiking Watch",  45, 25, 4);
-                watch->tft->drawString("Press button", 50, 80);
-                watch->tft->drawString("to start session", 40, 110);
-                exitSync = false;
+                sendSessionBT();
+                sessionSent = true;
             }
 
-            /*      IRQ     */
-            if (irqButton) {
-            irqButton = false;
-            watch->power->readIRQ();
-            
-            // CHECK THE LIMIT BEFORE STARTING
-            updateSessionCount(); 
-
-            if (storedSessionCount >= MAX_SESSIONS) {
-                // WARNING UI
-                watch->tft->fillScreen(TFT_RED);
-                watch->tft->setTextColor(TFT_WHITE);
-                watch->tft->drawString("MEMORY FULL!", 45, 80, 4);
-                watch->tft->drawString("Sync with RPi", 45, 110);
-                watch->tft->drawString("to clear space", 35, 140);
-                delay(3000); // Show warning for 3 seconds
+            if (incomingChar == 'r')
+            {
+                Serial.println("Got an R - Sync Complete");
+                deleteSession(); 
                 
-                // Redraw original screen
-                state = 1; 
-                break; // Exit while to refresh UI
-            } else {
-                state = 2; // Allow starting the hike
+                // IMPORTANT: Reset hardware flags so button works after sync
+                watch->power->readIRQ();
+                watch->power->clearIRQ();
+                irqButton = false; 
+
+                exitSync = true; // Break while loop to refresh state
                 break;
             }
-            watch->power->clearIRQ();
-            }
         }
-        break;
+
+        /* Button Handling */
+        if (irqButton) {
+            irqButton = false;
+            watch->power->readIRQ(); // Check hardware register
+            
+            // Only process if it's a short press
+            if (watch->power->isPEKShortPressIRQ()) {
+                updateSessionCount(); 
+
+                if (storedSessionCount >= MAX_SESSIONS) {
+                    // Draw Warning without permanently changing UI
+                    watch->tft->fillScreen(TFT_RED);
+                    watch->tft->setTextColor(TFT_WHITE);
+                    watch->tft->drawString("MEMORY FULL!", 45, 80, 4);
+                    watch->tft->drawString("Sync with RPi", 45, 110);
+                    delay(3000); 
+                    
+                    exitSync = true; // Redraw the normal black screen
+                } else {
+                    state = 2; // Allow starting hike
+                    exitSync = true;
+                }
+            }
+            watch->power->clearIRQ(); // Important to release the interrupt line
+        }
+        delay(10); 
     }
+    break; 
+}
     case 2:
     {
         /* Hiking session initalisation */
