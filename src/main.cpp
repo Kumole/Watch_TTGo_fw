@@ -49,7 +49,7 @@ const TouchButton END_TOUCH_BUTTON = {40, 170, 160, 50, TFT_RED, TFT_WHITE, "End
 
 int currentSessionIdx = 0;
 int storedSessionCount = 0;
-const int MAX_SESSIONS = 5;
+const int MAX_SESSIONS = 100;
 
 // Timer variables
 unsigned long last = 0;
@@ -114,6 +114,10 @@ String buildSessionPayload(const SessionRecord &record)
 
 String readFileAsString(fs::FS &fs, const char *path)
 {
+    if (!fs.exists(path)) {
+        return "";
+    }
+
     fs::File file = fs.open(path);
     if (!file || file.isDirectory()) {
         return "";
@@ -194,13 +198,25 @@ void initHikeWatch()
 
 void updateSessionCount() {
     storedSessionCount = 0;
-    for (int i = 0; i < MAX_SESSIONS; i++) {
-        char path[20];
-        sprintf(path, "/session_%d.json", i);
-        if (LittleFS.exists(path)) {
+
+    fs::File root = LittleFS.open("/");
+    if (!root || !root.isDirectory()) {
+        return;
+    }
+
+    fs::File file = root.openNextFile();
+    while (file) {
+        String name = file.name();
+        if (!file.isDirectory() &&
+            name.startsWith("/session_") &&
+            name.endsWith(".json")) {
             storedSessionCount++;
         }
+        file = root.openNextFile();
     }
+
+    Serial.print("Current session count: ");
+    Serial.println(storedSessionCount);
 }
 
 void sendSessionBLE() {
@@ -208,6 +224,7 @@ void sendSessionBLE() {
         return;
     }
 
+    Serial.println("SYNC_START");
     bleSendCommand("SYNC_START");
 
     for (int i = 0; i < MAX_SESSIONS; i++) {
@@ -228,6 +245,7 @@ void saveSessionData(int idx, const SessionRecord &record) {
 
     sprintf(path, "/session_%d.json", idx);
     String payload = buildSessionPayload(record);
+    Serial.println("SAVE_SESSION");
     writeFile(LittleFS, path, payload.c_str());
 }
 
@@ -253,9 +271,17 @@ void deleteSession() {
 void setup()
 {
     Serial.begin(115200);
+    delay(500);
+    Serial.println();
+    Serial.println("BOOT OK");
+
     watch = TTGOClass::getWatch();
+    Serial.println("Before watch->begin()");
     watch->begin();
+    Serial.println("After watch->begin()");
+    Serial.println("Before watch->openBL()");
     watch->openBL();
+    Serial.println("After watch->openBL()");
 
     //Receive objects for easy writing
     tft = watch->tft;
@@ -266,212 +292,186 @@ void setup()
     state = 1;
 
     bleInit("Hiking Watch");
+    Serial.println("SETUP DONE");
 }
 
 void loop()
 {
     switch (state)
     {
-    case 1:
-{
-    /* Initial stage */
-    updateSessionCount(); 
-    
-    // Clear hardware interrupt state before entering the loop
-    watch->power->readIRQ();
-    watch->power->clearIRQ();
-    irqButton = false;
-
-    // Draw your original Start Screen
-    watch->tft->fillScreen(TFT_BLACK);
-    watch->tft->setTextFont(4);
-    watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
-    watch->tft->drawString("Hiking Assistant", 25, 25, 4);
-    watch->tft->drawString("Press side button", 18, 80);
-    watch->tft->drawString("or tap screen", 37, 110);
-    drawTouchButton(START_TOUCH_BUTTON);
-
-    bool exitSync = false;
-    bool startTouchActive = false;
-    int16_t startTouchX = 0;
-    int16_t startTouchY = 0;
-
-    while (!exitSync) 
-    {
-        bleProcess();
-
-        /* BLE sync */
-        if (bleIsClientConnected() && sessionStored && !sessionSent) {
-            sendSessionBLE();
-            sessionSent = true;
-        }
-
-        String command = bleTakePendingCommand();
-        if (command.length() > 0) {
-
-            if (command == "SYNC_ACK") {
-                Serial.println("Received SYNC_ACK - deleting local sessions");
-                deleteSession();
-
-                // Reset hardware flags so button works after sync
-                watch->power->readIRQ();
-                watch->power->clearIRQ();
-                irqButton = false;
-
-                exitSync = true;
-                break;
-            }
-
-            if (command == "SYNC_ERROR") {
-                sessionSent = false;
-                watch->tft->fillScreen(TFT_RED);
-                watch->tft->setTextColor(TFT_WHITE, TFT_RED);
-                watch->tft->drawString("SYNC ERROR", 55, 85, 4);
-                watch->tft->drawString("Retrying...", 60, 115, 2);
-                delay(1200);
-
-                watch->tft->fillScreen(TFT_BLACK);
-                watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
-                watch->tft->drawString("Hiking Assistant", 45, 25, 4);
-                watch->tft->drawString("Press side button", 18, 80);
-                watch->tft->drawString("or tap screen", 37, 110);
-                drawTouchButton(START_TOUCH_BUTTON);
-            }
-        }
-
-        if (!bleIsClientConnected()) {
-            sessionSent = false;
-        }
-
-        if (touchButtonReleased(START_TOUCH_BUTTON, startTouchActive, startTouchX, startTouchY)) {
-            updateSessionCount();
-
-            if (storedSessionCount >= MAX_SESSIONS) {
-                watch->tft->fillScreen(TFT_RED);
-                watch->tft->setTextColor(TFT_WHITE);
-                watch->tft->drawString("MEMORY FULL!", 45, 80, 4);
-                watch->tft->drawString("Sync with RPi", 45, 110);
-                delay(3000);
-
-                exitSync = true;
-            } else {
-                state = 2;
-                exitSync = true;
-            }
-        }
-
-        /* Button Handling */
-        if (irqButton) {
-            irqButton = false;
-            watch->power->readIRQ(); // Check hardware register
+        case 1:
+        {
+            /* Initial stage */
+            updateSessionCount(); 
             
-            // Only process if it's a short press
-            if (watch->power->isPEKShortPressIRQ()) {
-                updateSessionCount(); 
+            // Clear hardware interrupt state before entering the loop
+            watch->power->readIRQ();
+            watch->power->clearIRQ();
+            irqButton = false;
 
-                if (storedSessionCount >= MAX_SESSIONS) {
-                    // Draw Warning without permanently changing UI
-                    watch->tft->fillScreen(TFT_RED);
-                    watch->tft->setTextColor(TFT_WHITE);
-                    watch->tft->drawString("MEMORY FULL!", 45, 80, 4);
-                    watch->tft->drawString("Sync with RPi", 45, 110);
-                    delay(3000); 
+            // Draw your original Start Screen
+            watch->tft->fillScreen(TFT_BLACK);
+            watch->tft->setTextFont(4);
+            watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
+            watch->tft->drawString("Hiking Assistant", 25, 25, 4);
+            watch->tft->drawString("Press side button", 18, 80);
+            watch->tft->drawString("or tap screen", 37, 110);
+            drawTouchButton(START_TOUCH_BUTTON);
+
+            bool exitSync = false;
+            bool startTouchActive = false;
+            int16_t startTouchX = 0;
+            int16_t startTouchY = 0;
+
+            while (!exitSync) 
+            {
+                bleProcess();
+
+                /* BLE sync */
+                if (bleIsClientConnected() && sessionStored && !sessionSent) {
+                    sendSessionBLE();
+                    sessionSent = true;
+                }
+
+                String command = bleTakePendingCommand();
+                if (command.length() > 0) {
+
+                    if (command == "SYNC_ACK") {
+                        Serial.println("Received SYNC_ACK - deleting local sessions");
+                        deleteSession();
+
+                        // Reset hardware flags so button works after sync
+                        watch->power->readIRQ();
+                        watch->power->clearIRQ();
+                        irqButton = false;
+
+                        exitSync = true;
+                        break;
+                    }
+
+                    if (command == "SYNC_ERROR") {
+                        sessionSent = false;
+                        watch->tft->fillScreen(TFT_RED);
+                        watch->tft->setTextColor(TFT_WHITE, TFT_RED);
+                        watch->tft->drawString("SYNC ERROR", 55, 85, 4);
+                        watch->tft->drawString("Retrying...", 60, 115, 2);
+                        delay(1200);
+
+                        watch->tft->fillScreen(TFT_BLACK);
+                        watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
+                        watch->tft->drawString("Hiking Assistant", 45, 25, 4);
+                        watch->tft->drawString("Press side button", 18, 80);
+                        watch->tft->drawString("or tap screen", 37, 110);
+                        drawTouchButton(START_TOUCH_BUTTON);
+                    }
+                }
+
+                if (!bleIsClientConnected()) {
+                    sessionSent = false;
+                }
+
+                if (touchButtonReleased(START_TOUCH_BUTTON, startTouchActive, startTouchX, startTouchY)) {
+                    updateSessionCount();
+
+                    if (storedSessionCount >= MAX_SESSIONS) {
+                        watch->tft->fillScreen(TFT_RED);
+                        watch->tft->setTextColor(TFT_WHITE);
+                        watch->tft->drawString("MEMORY FULL!", 45, 80, 4);
+                        watch->tft->drawString("Sync with RPi", 45, 110);
+                        delay(3000);
+
+                        exitSync = true;
+                    } else {
+                        state = 2;
+                        exitSync = true;
+                    }
+                }
+
+                /* Button Handling */
+                if (irqButton) {
+                    irqButton = false;
+                    watch->power->readIRQ(); // Check hardware register
                     
-                    exitSync = true; // Redraw the normal black screen
-                } else {
-                    state = 2; // Allow starting hike
-                    exitSync = true;
+                    // Only process if it's a short press
+                    if (watch->power->isPEKShortPressIRQ()) {
+                        updateSessionCount(); 
+
+                        if (storedSessionCount >= MAX_SESSIONS) {
+                            // Draw Warning without permanently changing UI
+                            watch->tft->fillScreen(TFT_RED);
+                            watch->tft->setTextColor(TFT_WHITE);
+                            watch->tft->drawString("MEMORY FULL!", 45, 80, 4);
+                            watch->tft->drawString("Sync with RPi", 45, 110);
+                            delay(3000); 
+                            
+                            exitSync = true; // Redraw the normal black screen
+                        } else {
+                            state = 2; // Allow starting hike
+                            exitSync = true;
+                        }
+                    }
+                    watch->power->clearIRQ(); // Important to release the interrupt line
                 }
+                delay(10); 
             }
-            watch->power->clearIRQ(); // Important to release the interrupt line
+            break; 
         }
-        delay(10); 
-    }
-    break; 
-}
-    case 2:
-    {
-        /* Hiking session initalisation */
-        activeSessionId = generateUuidV4();
-        activeSessionStartTime = currentIso8601();
-        activeSessionStartMillis = millis();
-        
-        state = 3;
-        break;
-    }
-    case 3:
-    {
-        /* Hiking session ongoing */
-        watch->tft->fillRect(0, 0, 240, 240, TFT_BLACK);
-        watch->tft->drawString("Starting hike", 45, 100);
-        delay(1000);
-        watch->tft->fillRect(0, 0, 240, 240, TFT_BLACK);
+        case 2:
+        {
+            /* Hiking session initalisation */
+            activeSessionId = generateUuidV4();
+            activeSessionStartTime = currentIso8601();
+            activeSessionStartMillis = millis();
+            
+            state = 3;
+            break;
+        }
+        case 3:
+        {
+            /* Hiking session ongoing */
+            watch->tft->fillRect(0, 0, 240, 240, TFT_BLACK);
+            watch->tft->drawString("Starting hike", 45, 100);
+            delay(1000);
+            watch->tft->fillRect(0, 0, 240, 240, TFT_BLACK);
 
-        watch->tft->setCursor(45, 70);
-        watch->tft->print("Steps: 0");
+            watch->tft->setCursor(45, 70);
+            watch->tft->print("Steps: 0");
 
-        watch->tft->setCursor(45, 100);
-        watch->tft->print("Dist: 0.0 km");
-        watch->tft->setCursor(30, 140);
-        drawTouchButton(END_TOUCH_BUTTON);
+            watch->tft->setCursor(45, 100);
+            watch->tft->print("Dist: 0.0 km");
+            watch->tft->setCursor(30, 140);
+            drawTouchButton(END_TOUCH_BUTTON);
 
-        uint32_t stepCount = 0;
-        float distanceKm = 0.0f;
-        unsigned long lastStepPoll = 0;
-        bool endTouchActive = false;
-        int16_t endTouchX = 0;
-        int16_t endTouchY = 0;
-        
-        // Ensure IRQ is clean before starting the loop
-        watch->power->readIRQ();
-        watch->power->clearIRQ();
-        irqButton = false; 
+            uint32_t stepCount = 0;
+            float distanceKm = 0.0f;
+            unsigned long lastStepPoll = 0;
+            bool endTouchActive = false;
+            int16_t endTouchX = 0;
+            int16_t endTouchY = 0;
+            
+            // Ensure IRQ is clean before starting the loop
+            watch->power->readIRQ();
+            watch->power->clearIRQ();
+            irqButton = false; 
 
-        while (state == 3) {
-            // Handle Step Interrupt
-            if (irqBMA) {
-                irqBMA = false;
-                if (sensor->readInterrupt() && sensor->isStepCounter()) {
-                    stepCount = sensor->getCounter();
-                    distanceKm = stepsToKilometers(stepCount);
-                    watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
-                    watch->tft->setCursor(120, 70); // Update just the number
-                    watch->tft->print(stepCount);
-                    watch->tft->print("   ");
-                    watch->tft->fillRect(95, 100, 110, 20, TFT_BLACK);
-                    watch->tft->setCursor(95, 100);
-                    watch->tft->print(distanceKm, 1);
-                    watch->tft->print(" km");
+            while (state == 3) {
+                // Handle Step Interrupt
+                if (irqBMA) {
+                    irqBMA = false;
+                    if (sensor->readInterrupt() && sensor->isStepCounter()) {
+                        stepCount = sensor->getCounter();
+                        distanceKm = stepsToKilometers(stepCount);
+                        watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
+                        watch->tft->setCursor(120, 70); // Update just the number
+                        watch->tft->print(stepCount);
+                        watch->tft->print("   ");
+                        watch->tft->fillRect(95, 100, 110, 20, TFT_BLACK);
+                        watch->tft->setCursor(95, 100);
+                        watch->tft->print(distanceKm, 1);
+                        watch->tft->print(" km");
+                    }
                 }
-            }
-            if (touchButtonReleased(END_TOUCH_BUTTON, endTouchActive, endTouchX, endTouchY)) {
-                SessionRecord record;
-                record.sessionId = activeSessionId;
-                record.startTime = activeSessionStartTime;
-                record.endTime = currentIso8601();
-                record.steps = stepCount;
-                record.distanceMeters = stepsToMeters(stepCount);
-                record.durationSeconds = (millis() - activeSessionStartMillis) / 1000;
-
-                saveSessionData(currentSessionIdx, record);
-
-                currentSessionIdx++;
-                if (currentSessionIdx >= MAX_SESSIONS) currentSessionIdx = 0;
-
-                updateSessionCount();
-
-                sessionStored = true;
-                state = 4;
-            }
-
-            // Handle Button Press to END session
-            if (irqButton) {
-                irqButton = false;
-                watch->power->readIRQ();
-                
-                // Only act if it was a short press
-                if (watch->power->isPEKShortPressIRQ()) {
-                    // 1. Save using the current index
+                if (touchButtonReleased(END_TOUCH_BUTTON, endTouchActive, endTouchX, endTouchY)) {
                     SessionRecord record;
                     record.sessionId = activeSessionId;
                     record.startTime = activeSessionStartTime;
@@ -481,33 +481,61 @@ void loop()
                     record.durationSeconds = (millis() - activeSessionStartMillis) / 1000;
 
                     saveSessionData(currentSessionIdx, record);
-                    
-                    // 2. Increment index for NEXT time (FIFO)
+
                     currentSessionIdx++;
                     if (currentSessionIdx >= MAX_SESSIONS) currentSessionIdx = 0;
-                    
-                    // 3. Update the total count for Case 1 guard
+
                     updateSessionCount();
-                    
+
                     sessionStored = true;
-                    state = 4; // Move to save/exit state
+                    state = 4;
                 }
-                watch->power->clearIRQ();
+
+                // Handle Button Press to END session
+                if (irqButton) {
+                    irqButton = false;
+                    watch->power->readIRQ();
+                    
+                    // Only act if it was a short press
+                    if (watch->power->isPEKShortPressIRQ()) {
+                        // 1. Save using the current index
+                        SessionRecord record;
+                        record.sessionId = activeSessionId;
+                        record.startTime = activeSessionStartTime;
+                        record.endTime = currentIso8601();
+                        record.steps = stepCount;
+                        record.distanceMeters = stepsToMeters(stepCount);
+                        record.durationSeconds = (millis() - activeSessionStartMillis) / 1000;
+
+                        saveSessionData(currentSessionIdx, record);
+                        
+                        // 2. Increment index for NEXT time (FIFO)
+                        currentSessionIdx++;
+                        if (currentSessionIdx >= MAX_SESSIONS) currentSessionIdx = 0;
+                        
+                        // 3. Update the total count for Case 1 guard
+                        updateSessionCount();
+                        
+                        sessionStored = true;
+                        state = 4; // Move to save/exit state
+                    }
+                    watch->power->clearIRQ();
+                }
+                delay(50); // Small delay to prevent CPU hogging
             }
-            delay(50); // Small delay to prevent CPU hogging
+            break; 
         }
-        break; 
-    }
-    case 4:
-    {
-        //Save hiking session data
-        delay(1000);
-        state = 1;  
-        break;
-    }
-    default:
-        // Restart watch
-        ESP.restart();
-        break;
+        case 4:
+        {
+            //Save hiking session data
+            delay(1000);
+            state = 1;  
+            break;
+        }
+        default:
+        {
+            // Restart watch
+            ESP.restart();
+        }
     }
 }
