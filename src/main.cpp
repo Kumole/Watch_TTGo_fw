@@ -49,7 +49,7 @@ const TouchButton END_TOUCH_BUTTON = {40, 170, 160, 50, TFT_RED, TFT_WHITE, "End
 
 int currentSessionIdx = 0;
 int storedSessionCount = 0;
-const int MAX_SESSIONS = 5;
+const int MAX_SESSIONS = 100;
 
 // Timer variables
 unsigned long last = 0;
@@ -411,7 +411,7 @@ void loop()
         watch->tft->print("Steps: 0");
 
         watch->tft->setCursor(45, 100);
-        watch->tft->print("Dist: 0.0 km");
+        watch->tft->print("Dist: 0.0 km");      // TODO: remove pre written steps/distance, instead immediately restore session data
         watch->tft->setCursor(30, 140);
         drawTouchButton(END_TOUCH_BUTTON);
 
