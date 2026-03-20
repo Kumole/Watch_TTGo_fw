@@ -30,7 +30,6 @@ volatile uint8_t state;
 volatile bool irqBMA = false;
 volatile bool irqButton = false;
 
-bool sessionStored = false;
 bool sessionSent = false;
 
 String activeSessionId;
@@ -443,7 +442,6 @@ void deleteSession() {
     activeSessionId = "";
     activeSessionStartTime = "";
     resumeSessionOnBoot = false;
-    sessionStored = false;
     sessionSent = false;
 
     if (LittleFS.exists(SESSION_STATE_PATH)) {
@@ -523,13 +521,13 @@ void loop()
                 // Classic Bluetooth sync via SerialBT
                 if (SerialBT.available()) {
                     char incoming = SerialBT.read();
-                    if (incoming == 'c' && sessionStored && !sessionSent) {
+                    if (incoming == 'c' && storedSessionCount > 0 && !sessionSent) {
                         sendSessionBT();
-                        sessionSent = true;
                     }
                     
                     if (incoming == 'r') {
                         Serial.println("Received R - Sync Complete");
+                        sessionSent = true;
                         deleteSession();
 
                         // Reset hardware flags so button works after sync
@@ -693,7 +691,6 @@ void loop()
 
                     updateSessionCount();
 
-                    sessionStored = true;
                     state = 4;
                 }
 
@@ -729,7 +726,6 @@ void loop()
                         // 3. Update the total count for Case 1 guard
                         updateSessionCount();
                         
-                        sessionStored = true;
                         state = 4; // Move to save/exit state
                     }
                     watch->power->clearIRQ();
