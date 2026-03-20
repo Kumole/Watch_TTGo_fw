@@ -250,7 +250,28 @@ void loadRuntimeState()
     activeSessionStartTime = getStateValue(content, "start_time");
     activeSessionElapsedBeforeResume = static_cast<uint32_t>(getStateValue(content, "elapsed_s").toInt());
     activeSessionBaseSteps = static_cast<uint32_t>(getStateValue(content, "steps").toInt());
+    // Ensure sensor hardware counter is accounted for: if the hardware counter
+    // contains any counts accumulated while the device was booting (or before
+    // we reset it), add them to the base and then reset the hardware counter.
+    uint32_t hwCounter = 0;
+    if (sensor != nullptr) {
+        hwCounter = sensor->getCounter();
+        if (hwCounter != 0) {
+            Serial.print("LOAD_STATE: hardware counter non-zero on load: ");
+            Serial.println(hwCounter);
+            Serial.print("LOAD_STATE: adding to activeSessionBaseSteps (before)=");
+            Serial.println(activeSessionBaseSteps);
+            activeSessionBaseSteps += hwCounter;
+            Serial.print("LOAD_STATE: activeSessionBaseSteps (after)=");
+            Serial.println(activeSessionBaseSteps);
+        }
+        // Reset the hardware counter so subsequent readings start from zero
+        resetStepCount();
+        Serial.println("LOAD_STATE: hardware counter reset after restoring state");
+    }
     activeSessionStartMillis = millis();
+    // Prevent immediate checkpointing flood by initializing checkpoint timestamp
+    lastSessionCheckpointAt = millis();
     resumeSessionOnBoot = true;
 
     Serial.print("Resuming active session from file index: ");
@@ -656,10 +677,17 @@ void loop()
             while (state == 3) {
                 // Handle Step Interrupt
                 if (irqBMA) {
+                    Serial.println("MAIN: irqBMA true - handling step interrupt");
                     irqBMA = false;
                     if (sensor->readInterrupt() && sensor->isStepCounter()) {
                         stepCount = activeSessionBaseSteps + sensor->getCounter();
+                        Serial.print("MAIN: sensor->getCounter()=");
+                        Serial.println(sensor->getCounter());
+                        Serial.print("MAIN: computed stepCount=");
+                        Serial.println(stepCount);
                         renderSessionMetrics(stepCount);
+                    } else {
+                        Serial.println("MAIN: irqBMA but no step counter interrupt reported by sensor");
                     }
                 }
                 if (touchButtonReleased(END_TOUCH_BUTTON, endTouchActive, endTouchX, endTouchY)) {
@@ -717,7 +745,7 @@ void loop()
                         resumeSessionOnBoot = false;
 
                         saveRuntimeState(false);
-                        
+
                         // 3. Update the total count for Case 1 guard
                         updateSessionCount();
                         
@@ -739,9 +767,18 @@ void loop()
                     checkpoint.durationSeconds = elapsed;
                     saveSessionData(activeSessionFileIdx, checkpoint);
 
+                    Serial.print("MAIN: checkpoint saved, stepCount=");
+                    Serial.println(stepCount);
+
                     activeSessionBaseSteps = stepCount;
                     activeSessionElapsedBeforeResume = elapsed;
                     activeSessionStartMillis = millis();
+                    // Reset the sensor hardware counter after taking a checkpoint. The
+                    // code uses: total_steps = activeSessionBaseSteps + sensor->getCounter();
+                    // If we don't reset the hardware counter here, sensor->getCounter()
+                    // remains cumulative and the next calculation will double-count.
+                    resetStepCount();
+                    Serial.println("MAIN: resetStepCount called after checkpoint");
                     saveRuntimeState(true);
                     lastSessionCheckpointAt = millis();
                 }
