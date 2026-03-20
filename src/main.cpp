@@ -527,6 +527,7 @@ void loop()
                         sendSessionBT();
                         sessionSent = true;
                     }
+                    
                     if (incoming == 'r') {
                         Serial.println("Received R - Sync Complete");
                         deleteSession();
