@@ -33,6 +33,12 @@ bool sessionSent = false;
 String activeSessionId;
 String activeSessionStartTime;
 unsigned long activeSessionStartMillis = 0;
+uint32_t activeSessionElapsedBeforeResume = 0;
+uint32_t activeSessionBaseSteps = 0;
+int activeSessionFileIdx = -1;
+bool resumeSessionOnBoot = false;
+const unsigned long SESSION_CHECKPOINT_INTERVAL_MS = 10000;
+unsigned long lastSessionCheckpointAt = 0;
 
 struct TouchButton {
     int16_t x;
@@ -47,9 +53,17 @@ struct TouchButton {
 const TouchButton START_TOUCH_BUTTON = {40, 150, 160, 50, TFT_DARKGREEN, TFT_WHITE, "Start session"};
 const TouchButton END_TOUCH_BUTTON = {40, 170, 160, 50, TFT_RED, TFT_WHITE, "End session"};
 
+const int16_t STEPS_LABEL_X = 45;
+const int16_t STEPS_Y = 70;
+const int16_t STEPS_VALUE_X = 120;
+const int16_t DIST_LABEL_X = 45;
+const int16_t DIST_Y = 100;
+const int16_t DIST_VALUE_X = 95;
+
 int currentSessionIdx = 0;
 int storedSessionCount = 0;
 const int MAX_SESSIONS = 100;
+const char *SESSION_STATE_PATH = "/session_state.txt";
 
 // Timer variables
 unsigned long last = 0;
@@ -107,7 +121,8 @@ String buildSessionPayload(const SessionRecord &record)
     json += "\"end_time\":\"" + record.endTime + "\",";
     json += "\"steps\":" + String(record.steps) + ",";
     json += "\"distance_m\":" + String(record.distanceMeters) + ",";
-    json += "\"duration_s\":" + String(record.durationSeconds);
+    json += "\"duration_s\":" + String(record.durationSeconds) + ",";
+    json += "\"in_progress\":" + String(record.endTime.length() == 0 ? "true" : "false");
     json += "}";
     return json;
 }
@@ -131,6 +146,117 @@ String readFileAsString(fs::FS &fs, const char *path)
     return content;
 }
 
+bool parseSessionFileIndex(const String &rawName, int &idx)
+{
+    String name = rawName;
+    if (name.startsWith("/")) {
+        name.remove(0, 1);
+    }
+
+    if (!name.startsWith("session_") || !name.endsWith(".json")) {
+        return false;
+    }
+
+    int prefixLen = strlen("session_");
+    int suffixPos = name.lastIndexOf(".json");
+    if (suffixPos <= prefixLen) {
+        return false;
+    }
+
+    String numberPart = name.substring(prefixLen, suffixPos);
+    for (int i = 0; i < numberPart.length(); i++) {
+        if (!isDigit(numberPart.charAt(i))) {
+            return false;
+        }
+    }
+
+    idx = numberPart.toInt();
+    return idx >= 0 && idx < MAX_SESSIONS;
+}
+
+String getStateValue(const String &content, const char *key)
+{
+    String prefix = String(key) + "=";
+    int start = content.indexOf(prefix);
+    if (start < 0) {
+        return "";
+    }
+
+    start += prefix.length();
+    int end = content.indexOf('\n', start);
+    if (end < 0) {
+        end = content.length();
+    }
+
+    String value = content.substring(start, end);
+    value.trim();
+    return value;
+}
+
+void saveRuntimeState(bool sessionActive)
+{
+    int nextIdx = currentSessionIdx;
+    if (nextIdx < 0 || nextIdx >= MAX_SESSIONS) {
+        nextIdx = 0;
+    }
+
+    String serialized;
+    serialized += "active=" + String(sessionActive ? 1 : 0) + "\n";
+    serialized += "next_idx=" + String(nextIdx) + "\n";
+    serialized += "active_idx=" + String(activeSessionFileIdx) + "\n";
+    serialized += "session_id=" + activeSessionId + "\n";
+    serialized += "start_time=" + activeSessionStartTime + "\n";
+    serialized += "elapsed_s=" + String(activeSessionElapsedBeforeResume) + "\n";
+    serialized += "steps=" + String(activeSessionBaseSteps) + "\n";
+    writeFile(LittleFS, SESSION_STATE_PATH, serialized.c_str());
+}
+
+void loadRuntimeState()
+{
+    if (!LittleFS.exists(SESSION_STATE_PATH)) {
+        return;
+    }
+
+    String content = readFileAsString(LittleFS, SESSION_STATE_PATH);
+    if (content.length() == 0) {
+        return;
+    }
+
+    String nextIdxRaw = getStateValue(content, "next_idx");
+    if (nextIdxRaw.length() > 0) {
+        int parsedNextIdx = nextIdxRaw.toInt();
+        if (parsedNextIdx >= 0 && parsedNextIdx < MAX_SESSIONS) {
+            currentSessionIdx = parsedNextIdx;
+        }
+    }
+
+    if (getStateValue(content, "active").toInt() != 1) {
+        return;
+    }
+
+    int restoredIdx = getStateValue(content, "active_idx").toInt();
+    if (restoredIdx < 0 || restoredIdx >= MAX_SESSIONS) {
+        return;
+    }
+
+    char activePath[20];
+    sprintf(activePath, "/session_%d.json", restoredIdx);
+    if (!LittleFS.exists(activePath)) {
+        return;
+    }
+
+    activeSessionFileIdx = restoredIdx;
+    activeSessionId = getStateValue(content, "session_id");
+    activeSessionStartTime = getStateValue(content, "start_time");
+    activeSessionElapsedBeforeResume = static_cast<uint32_t>(getStateValue(content, "elapsed_s").toInt());
+    activeSessionBaseSteps = static_cast<uint32_t>(getStateValue(content, "steps").toInt());
+    activeSessionStartMillis = millis();
+    resumeSessionOnBoot = true;
+
+    Serial.print("Resuming active session from file index: ");
+    Serial.println(activeSessionFileIdx);
+}
+
 bool isTouchInsideButton(const TouchButton &button, int16_t x, int16_t y)
 {
     return x >= button.x && x <= (button.x + button.w) &&
@@ -144,6 +270,21 @@ void drawTouchButton(const TouchButton &button)
     tft->setTextColor(button.textColor, button.fillColor);
     tft->drawCentreString(button.label, button.x + (button.w / 2), button.y + 16, 2);
     tft->setTextColor(TFT_WHITE, TFT_BLACK);
+}
+
+void renderSessionMetrics(uint32_t stepCount)
+{
+    float distanceKm = stepsToKilometers(stepCount);
+
+    tft->setTextColor(TFT_WHITE, TFT_BLACK);
+    tft->setCursor(STEPS_VALUE_X, STEPS_Y);
+    tft->print(stepCount);
+    tft->print("   ");
+
+    tft->fillRect(DIST_VALUE_X, DIST_Y, 110, 20, TFT_BLACK);
+    tft->setCursor(DIST_VALUE_X, DIST_Y);
+    tft->print(distanceKm, 1);
+    tft->print(" km");
 }
 
 bool touchButtonReleased(const TouchButton &button, bool &touchActive, int16_t &lastTouchX, int16_t &lastTouchY)
@@ -198,6 +339,7 @@ void initHikeWatch()
 
 void updateSessionCount() {
     storedSessionCount = 0;
+    int highestSessionIdx = -1;
 
     fs::File root = LittleFS.open("/");
     if (!root || !root.isDirectory()) {
@@ -207,16 +349,27 @@ void updateSessionCount() {
     fs::File file = root.openNextFile();
     while (file) {
         String name = file.name();
-        if (!file.isDirectory() &&
-            name.startsWith("/session_") &&
-            name.endsWith(".json")) {
+        int parsedIdx = -1;
+        if (!file.isDirectory() && parseSessionFileIndex(name, parsedIdx)) {
             storedSessionCount++;
+            if (parsedIdx > highestSessionIdx) {
+                highestSessionIdx = parsedIdx;
+            }
         }
         file = root.openNextFile();
     }
 
+    if (!LittleFS.exists(SESSION_STATE_PATH) && highestSessionIdx >= 0) {
+        currentSessionIdx = highestSessionIdx + 1;
+        if (currentSessionIdx >= MAX_SESSIONS) {
+            currentSessionIdx = 0;
+        }
+    }
+
     Serial.print("Current session count: ");
     Serial.println(storedSessionCount);
+    Serial.print("Next session index: ");
+    Serial.println(currentSessionIdx);
 }
 
 void sendSessionBLE() {
@@ -225,7 +378,7 @@ void sendSessionBLE() {
     }
 
     Serial.println("SYNC_START");
-    bleSendCommand("SYNC_START");
+    bleSendCommand("SYNC_START", "");
 
     for (int i = 0; i < MAX_SESSIONS; i++) {
         char path[20];
@@ -233,7 +386,7 @@ void sendSessionBLE() {
         
         if (LittleFS.exists(path)) {
             String payload = readFileAsString(LittleFS, path);
-            if (payload.length() > 0) {
+            if (payload.length() > 0 && payload.indexOf("\"in_progress\":true") < 0) {
                 bleSendCommand("SESSION_DATA", payload);
             }
         }
@@ -254,14 +407,26 @@ void deleteSession() {
     for (int i = 0; i < MAX_SESSIONS; i++) {
         char path[20];
         sprintf(path, "/session_%d.json", i);
-        LittleFS.remove(path);
+        if (LittleFS.exists(path)) {
+            LittleFS.remove(path);
+        }
     }
     
     // Force reset variables
     storedSessionCount = 0; 
     currentSessionIdx = 0;
+    activeSessionFileIdx = -1;
+    activeSessionElapsedBeforeResume = 0;
+    activeSessionBaseSteps = 0;
+    activeSessionId = "";
+    activeSessionStartTime = "";
+    resumeSessionOnBoot = false;
     sessionStored = false;
     sessionSent = false;
+
+    if (LittleFS.exists(SESSION_STATE_PATH)) {
+        LittleFS.remove(SESSION_STATE_PATH);
+    }
 
     updateSessionCount();
     Serial.print("Verification - Stored sessions: ");
@@ -287,9 +452,15 @@ void setup()
     tft = watch->tft;
     sensor = watch->bma;
     
+    tft->fillScreen(TFT_BLACK);
+    tft->setTextFont(4);
+    tft->setTextSize(1);
+    tft->setTextColor(TFT_WHITE, TFT_BLACK);
+    
     initHikeWatch();
     updateSessionCount();
-    state = 1;
+    loadRuntimeState();
+    state = resumeSessionOnBoot ? 3 : 1;
 
     bleInit("Hiking Watch");
     Serial.println("SETUP DONE");
@@ -419,9 +590,25 @@ void loop()
         case 2:
         {
             /* Hiking session initalisation */
+            resetStepCount();
             activeSessionId = generateUuidV4();
             activeSessionStartTime = currentIso8601();
             activeSessionStartMillis = millis();
+            activeSessionElapsedBeforeResume = 0;
+            activeSessionBaseSteps = 0;
+            activeSessionFileIdx = currentSessionIdx;
+
+            SessionRecord initialRecord;
+            initialRecord.sessionId = activeSessionId;
+            initialRecord.startTime = activeSessionStartTime;
+            initialRecord.endTime = "";
+            initialRecord.steps = 0;
+            initialRecord.distanceMeters = 0;
+            initialRecord.durationSeconds = 0;
+            saveSessionData(activeSessionFileIdx, initialRecord);
+
+            saveRuntimeState(true);
+            lastSessionCheckpointAt = millis();
             
             state = 3;
             break;
@@ -429,25 +616,37 @@ void loop()
         case 3:
         {
             /* Hiking session ongoing */
-            watch->tft->fillRect(0, 0, 240, 240, TFT_BLACK);
-            watch->tft->drawString("Starting hike", 45, 100);
+            watch->tft->setTextFont(4);
+            watch->tft->setTextSize(1);
+            watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
+            watch->tft->fillScreen(TFT_BLACK);
+            
+            if (resumeSessionOnBoot) {
+                watch->tft->drawString("Resuming hike", 45, 100);
+            } else {
+                watch->tft->drawString("Starting hike", 45, 100);
+            }
             delay(1000);
-            watch->tft->fillRect(0, 0, 240, 240, TFT_BLACK);
+            watch->tft->fillScreen(TFT_BLACK);
 
-            watch->tft->setCursor(45, 70);
+            watch->tft->setCursor(STEPS_LABEL_X, STEPS_Y);
             watch->tft->print("Steps: 0");
 
-            watch->tft->setCursor(45, 100);
+            watch->tft->setCursor(DIST_LABEL_X, DIST_Y);
             watch->tft->print("Dist: 0.0 km");
             watch->tft->setCursor(30, 140);
             drawTouchButton(END_TOUCH_BUTTON);
 
-            uint32_t stepCount = 0;
-            float distanceKm = 0.0f;
-            unsigned long lastStepPoll = 0;
+            if (activeSessionFileIdx < 0 || activeSessionFileIdx >= MAX_SESSIONS) {
+                activeSessionFileIdx = currentSessionIdx;
+            }
+
+            uint32_t stepCount = activeSessionBaseSteps + sensor->getCounter();
             bool endTouchActive = false;
             int16_t endTouchX = 0;
             int16_t endTouchY = 0;
+
+            renderSessionMetrics(stepCount);
             
             // Ensure IRQ is clean before starting the loop
             watch->power->readIRQ();
@@ -459,16 +658,8 @@ void loop()
                 if (irqBMA) {
                     irqBMA = false;
                     if (sensor->readInterrupt() && sensor->isStepCounter()) {
-                        stepCount = sensor->getCounter();
-                        distanceKm = stepsToKilometers(stepCount);
-                        watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
-                        watch->tft->setCursor(120, 70); // Update just the number
-                        watch->tft->print(stepCount);
-                        watch->tft->print("   ");
-                        watch->tft->fillRect(95, 100, 110, 20, TFT_BLACK);
-                        watch->tft->setCursor(95, 100);
-                        watch->tft->print(distanceKm, 1);
-                        watch->tft->print(" km");
+                        stepCount = activeSessionBaseSteps + sensor->getCounter();
+                        renderSessionMetrics(stepCount);
                     }
                 }
                 if (touchButtonReleased(END_TOUCH_BUTTON, endTouchActive, endTouchX, endTouchY)) {
@@ -478,12 +669,19 @@ void loop()
                     record.endTime = currentIso8601();
                     record.steps = stepCount;
                     record.distanceMeters = stepsToMeters(stepCount);
-                    record.durationSeconds = (millis() - activeSessionStartMillis) / 1000;
+                    record.durationSeconds = activeSessionElapsedBeforeResume + ((millis() - activeSessionStartMillis) / 1000);
 
-                    saveSessionData(currentSessionIdx, record);
+                    saveSessionData(activeSessionFileIdx, record);
 
-                    currentSessionIdx++;
+                    currentSessionIdx = activeSessionFileIdx + 1;
                     if (currentSessionIdx >= MAX_SESSIONS) currentSessionIdx = 0;
+
+                    activeSessionFileIdx = -1;
+                    activeSessionElapsedBeforeResume = 0;
+                    activeSessionBaseSteps = 0;
+                    resumeSessionOnBoot = false;
+
+                    saveRuntimeState(false);
 
                     updateSessionCount();
 
@@ -505,13 +703,20 @@ void loop()
                         record.endTime = currentIso8601();
                         record.steps = stepCount;
                         record.distanceMeters = stepsToMeters(stepCount);
-                        record.durationSeconds = (millis() - activeSessionStartMillis) / 1000;
+                        record.durationSeconds = activeSessionElapsedBeforeResume + ((millis() - activeSessionStartMillis) / 1000);
 
-                        saveSessionData(currentSessionIdx, record);
+                        saveSessionData(activeSessionFileIdx, record);
                         
                         // 2. Increment index for NEXT time (FIFO)
-                        currentSessionIdx++;
+                        currentSessionIdx = activeSessionFileIdx + 1;
                         if (currentSessionIdx >= MAX_SESSIONS) currentSessionIdx = 0;
+
+                        activeSessionFileIdx = -1;
+                        activeSessionElapsedBeforeResume = 0;
+                        activeSessionBaseSteps = 0;
+                        resumeSessionOnBoot = false;
+
+                        saveRuntimeState(false);
                         
                         // 3. Update the total count for Case 1 guard
                         updateSessionCount();
@@ -521,6 +726,26 @@ void loop()
                     }
                     watch->power->clearIRQ();
                 }
+
+                if (state == 3 && (millis() - lastSessionCheckpointAt) >= SESSION_CHECKPOINT_INTERVAL_MS) {
+                    uint32_t elapsed = activeSessionElapsedBeforeResume + ((millis() - activeSessionStartMillis) / 1000);
+
+                    SessionRecord checkpoint;
+                    checkpoint.sessionId = activeSessionId;
+                    checkpoint.startTime = activeSessionStartTime;
+                    checkpoint.endTime = "";
+                    checkpoint.steps = stepCount;
+                    checkpoint.distanceMeters = stepsToMeters(stepCount);
+                    checkpoint.durationSeconds = elapsed;
+                    saveSessionData(activeSessionFileIdx, checkpoint);
+
+                    activeSessionBaseSteps = stepCount;
+                    activeSessionElapsedBeforeResume = elapsed;
+                    activeSessionStartMillis = millis();
+                    saveRuntimeState(true);
+                    lastSessionCheckpointAt = millis();
+                }
+
                 delay(50); // Small delay to prevent CPU hogging
             }
             break; 
