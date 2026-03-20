@@ -70,6 +70,10 @@ void readFile(fs::FS &fs, const char * path){
 void writeFile(fs::FS &fs, const char * path, const char * message){
     Serial.printf("Writing file: %s\r\n", path);
 
+    if (fs.exists(path)) {
+        fs.remove(path);
+    }
+
     File file = fs.open(path, FILE_WRITE);
     if(!file){
         Serial.println("- failed to open file for writing");

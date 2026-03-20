@@ -1,0 +1,4 @@
+PyBluez==0.23
+flask==1.1.2
+pillow
+# unicornhathd=0.0.4 # you need to install this as sudo
