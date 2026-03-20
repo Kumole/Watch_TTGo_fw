@@ -67,6 +67,9 @@ int storedSessionCount = 0;
 const int MAX_SESSIONS = 100;
 const char *SESSION_STATE_PATH = "/session_state.txt";
 
+bool waitingForAck = false;
+String pendingSessionId = "";
+
 // Timer variables
 unsigned long last = 0;
 unsigned long updateTimeout = 0;
@@ -127,6 +130,14 @@ String buildSessionPayload(const SessionRecord &record)
     json += "\"in_progress\":" + String(record.endTime.length() == 0 ? "true" : "false");
     json += "}";
     return json;
+}
+
+String normalizeFsPath(const String &name)
+{
+    if (name.startsWith("/")) {
+        return name;
+    }
+    return "/" + name;
 }
 
 String readFileAsString(fs::FS &fs, const char *path)
@@ -435,36 +446,55 @@ void updateSessionCount() {
 }
 
 bool sendNextFinishedSessionBT() {
-    if (storedSessionCount == 0) {
-        Serial.println("SYNC: no stored sessions to send");
+    if (storedSessionCount == 0 || waitingForAck) {
         return false;
     }
 
-    for (int i = 0; i < MAX_SESSIONS; i++) {
-        char path[20];
-        sprintf(path, "/session_%d.json", i);
-
-        if (!LittleFS.exists(path)) {
-            continue;
-        }
-
-        String payload = readFileAsString(LittleFS, path);
-        if (payload.length() == 0) {
-            continue;
-        }
-
-        if (payload.indexOf("\"in_progress\":true") >= 0) {
-            continue;
-        }
-
-        Serial.print("SYNC: sending one session from ");
-        Serial.println(path);
-
-        SerialBT.print(payload);
-        SerialBT.print('\n');
-        return true;
+    fs::File root = LittleFS.open("/");
+    if (!root || !root.isDirectory()) {
+        Serial.println("SYNC: failed to open LittleFS root");
+        return false;
     }
 
+    fs::File file = root.openNextFile();
+    while (file) {
+        String name = file.name();
+        String path = normalizeFsPath(name);
+        int parsedIdx = -1;
+
+        if (!file.isDirectory() && parseSessionFileIndex(name, parsedIdx)) {
+            String payload = readFileAsString(LittleFS, path.c_str());
+
+            if (payload.length() > 0 && payload.indexOf("\"in_progress\":true") < 0) {
+                String sessionId = "";
+                int start = payload.indexOf("\"session_id\":\"");
+                if (start >= 0) {
+                    start += strlen("\"session_id\":\"");
+                    int end = payload.indexOf("\"", start);
+                    if (end > start) {
+                        sessionId = payload.substring(start, end);
+                    }
+                }
+
+                Serial.print("SYNC: sending one session from ");
+                Serial.println(path);
+
+                SerialBT.print(payload);
+                SerialBT.print('\n');
+
+                waitingForAck = true;
+                pendingSessionId = sessionId;
+
+                file.close();
+                root.close();
+                return true;
+            }
+        }
+
+        file = root.openNextFile();
+    }
+
+    root.close();
     Serial.println("SYNC: no finished sessions found");
     return false;
 }
@@ -478,33 +508,46 @@ void saveSessionData(int idx, const SessionRecord &record) {
     writeFile(LittleFS, path, payload.c_str());
 }
 
-void deleteSession() {
-    Serial.println("Deleting all sessions...");
-    for (int i = 0; i < MAX_SESSIONS; i++) {
-        char path[20];
-        sprintf(path, "/session_%d.json", i);
-        if (LittleFS.exists(path)) {
-            LittleFS.remove(path);
+bool deleteSessionById(const String &sessionId) {
+    fs::File root = LittleFS.open("/");
+    if (!root || !root.isDirectory()) {
+        Serial.println("SYNC: failed to open LittleFS root for delete");
+        return false;
+    }
+
+    fs::File file = root.openNextFile();
+    while (file) {
+        String name = file.name();
+        String path = normalizeFsPath(name);
+
+        int parsedIdx = -1;
+        if (!file.isDirectory() && parseSessionFileIndex(name, parsedIdx)) {
+            String payload = readFileAsString(LittleFS, path.c_str());
+            String pattern = "\"session_id\":\"" + sessionId + "\"";
+
+            if (payload.indexOf(pattern) >= 0) {
+                Serial.print("SYNC: deleting acknowledged session from ");
+                Serial.println(path);
+
+                file.close();
+                root.close();
+
+                if (LittleFS.remove(path)) {
+                    updateSessionCount();
+                    return true;
+                } else {
+                    Serial.println("SYNC: failed to delete acknowledged session");
+                    return false;
+                }
+            }
         }
+
+        file = root.openNextFile();
     }
 
-    storedSessionCount = 0;
-    currentSessionIdx = 0;
-    activeSessionFileIdx = -1;
-    activeSessionElapsedBeforeResume = 0;
-    activeSessionBaseSteps = 0;
-    activeSessionId = "";
-    activeSessionStartTime = "";
-    resumeSessionOnBoot = false;
-    sessionSent = false;
-
-    if (LittleFS.exists(SESSION_STATE_PATH)) {
-        LittleFS.remove(SESSION_STATE_PATH);
-    }
-
-    updateSessionCount();
-    Serial.print("Verification - Stored sessions: ");
-    Serial.println(storedSessionCount);
+    Serial.print("SYNC: acknowledged session id not found: ");
+    Serial.println(sessionId);
+    return false;
 }
 
 void setup()
@@ -568,25 +611,49 @@ void loop()
             while (!exitSync)
             {
                 if (SerialBT.available()) {
-                    char incoming = SerialBT.read();
-                    if (incoming == 'c' && storedSessionCount > 0 && !sessionSent) {
-                        sendNextFinishedSessionBT();
+                    String incoming = SerialBT.readStringUntil('\n');
+                    incoming.trim();
+
+                    if (incoming.length() > 0) {
+                        Serial.print("SYNC: received command: ");
+                        Serial.println(incoming);
                     }
 
-                    if (incoming == 'r') {
-                        Serial.println("Received R - Sync Complete");
-                        sessionSent = true;
-                        deleteSession();
+                    if (incoming == "c") {
+                        if (!waitingForAck) {
+                            sendNextFinishedSessionBT();
+                        } else {
+                            Serial.println("SYNC: ignoring c while waiting for ack");
+                        }
+                    }
+                    else if (incoming.startsWith("a:")) {
+                        String ackId = incoming.substring(2);
+                        ackId.trim();
 
-                        watch->power->readIRQ();
-                        watch->power->clearIRQ();
-                        irqButton = false;
+                        if (!waitingForAck) {
+                            Serial.println("SYNC: ignoring unexpected ack");
+                        } else if (ackId != pendingSessionId) {
+                            Serial.println("SYNC: ignoring ack for non-pending session");
+                        } else {
+                            if (deleteSessionById(ackId)) {
+                                waitingForAck = false;
+                                pendingSessionId = "";
 
-                        exitSync = true;
-                        break;
+                                if (!sendNextFinishedSessionBT()) {
+                                    Serial.println("SYNC: all finished sessions acknowledged");
+                                    sessionSent = true;
+
+                                    watch->power->readIRQ();
+                                    watch->power->clearIRQ();
+                                    irqButton = false;
+
+                                    exitSync = true;
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
-
                 if (touchButtonReleased(START_TOUCH_BUTTON, startTouchActive, startTouchX, startTouchY)) {
                     updateSessionCount();
 
@@ -638,6 +705,8 @@ void loop()
             activeSessionElapsedBeforeResume = 0;
             activeSessionBaseSteps = 0;   // brand new session starts from zero base
             activeSessionFileIdx = currentSessionIdx;
+            waitingForAck = false;
+            pendingSessionId = "";
 
             SessionRecord initialRecord;
             initialRecord.sessionId = activeSessionId;
