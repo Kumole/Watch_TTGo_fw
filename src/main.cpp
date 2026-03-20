@@ -1,6 +1,6 @@
 #include "config.h"
 #include "stepCounter.h"
-#include "ble.h"
+#include <BluetoothSerial.h>
 #include <esp_system.h>
 #include <time.h>
 
@@ -13,6 +13,9 @@
 TTGOClass *watch;
 TFT_eSPI *tft;
 BMA *sensor;
+
+// Classic Bluetooth serial (RFCOMM) for compatibility with RPi receiver
+BluetoothSerial SerialBT;
 
 struct SessionRecord {
     String sessionId;
@@ -393,22 +396,20 @@ void updateSessionCount() {
     Serial.println(currentSessionIdx);
 }
 
-void sendSessionBLE() {
+void sendSessionBT() {
     if (storedSessionCount == 0) {
         return;
     }
 
-    Serial.println("SYNC_START");
-    bleSendCommand("SYNC_START", "");
-
     for (int i = 0; i < MAX_SESSIONS; i++) {
         char path[20];
         sprintf(path, "/session_%d.json", i);
-        
         if (LittleFS.exists(path)) {
             String payload = readFileAsString(LittleFS, path);
             if (payload.length() > 0 && payload.indexOf("\"in_progress\":true") < 0) {
-                bleSendCommand("SESSION_DATA", payload);
+                // send via SerialBT
+                SerialBT.print(payload);
+                SerialBT.print('\n');
             }
         }
     }
@@ -483,7 +484,9 @@ void setup()
     loadRuntimeState();
     state = resumeSessionOnBoot ? 3 : 1;
 
-    bleInit("Hiking Watch");
+    // Classic Bluetooth serial
+    SerialBT.begin("Hiking Watch");
+
     Serial.println("SETUP DONE");
 }
 
@@ -517,19 +520,15 @@ void loop()
 
             while (!exitSync) 
             {
-                bleProcess();
-
-                /* BLE sync */
-                if (bleIsClientConnected() && sessionStored && !sessionSent) {
-                    sendSessionBLE();
-                    sessionSent = true;
-                }
-
-                String command = bleTakePendingCommand();
-                if (command.length() > 0) {
-
-                    if (command == "SYNC_ACK") {
-                        Serial.println("Received SYNC_ACK - deleting local sessions");
+                // Classic Bluetooth sync via SerialBT
+                if (SerialBT.available()) {
+                    char incoming = SerialBT.read();
+                    if (incoming == 'c' && sessionStored && !sessionSent) {
+                        sendSessionBT();
+                        sessionSent = true;
+                    }
+                    if (incoming == 'r') {
+                        Serial.println("Received R - Sync Complete");
                         deleteSession();
 
                         // Reset hardware flags so button works after sync
@@ -540,26 +539,6 @@ void loop()
                         exitSync = true;
                         break;
                     }
-
-                    if (command == "SYNC_ERROR") {
-                        sessionSent = false;
-                        watch->tft->fillScreen(TFT_RED);
-                        watch->tft->setTextColor(TFT_WHITE, TFT_RED);
-                        watch->tft->drawString("SYNC ERROR", 55, 85, 4);
-                        watch->tft->drawString("Retrying...", 60, 115, 2);
-                        delay(1200);
-
-                        watch->tft->fillScreen(TFT_BLACK);
-                        watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
-                        watch->tft->drawString("Hiking Assistant", 45, 25, 4);
-                        watch->tft->drawString("Press side button", 18, 80);
-                        watch->tft->drawString("or tap screen", 37, 110);
-                        drawTouchButton(START_TOUCH_BUTTON);
-                    }
-                }
-
-                if (!bleIsClientConnected()) {
-                    sessionSent = false;
                 }
 
                 if (touchButtonReleased(START_TOUCH_BUTTON, startTouchActive, startTouchX, startTouchY)) {
