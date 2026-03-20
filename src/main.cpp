@@ -395,23 +395,39 @@ void updateSessionCount() {
     Serial.println(currentSessionIdx);
 }
 
-void sendSessionBT() {
+bool sendNextFinishedSessionBT() {
     if (storedSessionCount == 0) {
-        return;
+        Serial.println("SYNC: no stored sessions to send");
+        return false;
     }
 
     for (int i = 0; i < MAX_SESSIONS; i++) {
         char path[20];
         sprintf(path, "/session_%d.json", i);
-        if (LittleFS.exists(path)) {
-            String payload = readFileAsString(LittleFS, path);
-            if (payload.length() > 0 && payload.indexOf("\"in_progress\":true") < 0) {
-                // send via SerialBT
-                SerialBT.print(payload);
-                SerialBT.print('\n');
-            }
+
+        if (!LittleFS.exists(path)) {
+            continue;
         }
+
+        String payload = readFileAsString(LittleFS, path);
+        if (payload.length() == 0) {
+            continue;
+        }
+
+        if (payload.indexOf("\"in_progress\":true") >= 0) {
+            continue;
+        }
+
+        Serial.print("SYNC: sending one session from ");
+        Serial.println(path);
+
+        SerialBT.print(payload);
+        SerialBT.print('\n');
+        return true;
     }
+
+    Serial.println("SYNC: no finished sessions found");
+    return false;
 }
 
 void saveSessionData(int idx, const SessionRecord &record) {
@@ -522,7 +538,7 @@ void loop()
                 if (SerialBT.available()) {
                     char incoming = SerialBT.read();
                     if (incoming == 'c' && storedSessionCount > 0 && !sessionSent) {
-                        sendSessionBT();
+                        sendNextFinishedSessionBT();
                     }
                     
                     if (incoming == 'r') {
