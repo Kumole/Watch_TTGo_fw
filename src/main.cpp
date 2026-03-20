@@ -36,7 +36,7 @@ String activeSessionId;
 String activeSessionStartTime;
 unsigned long activeSessionStartMillis = 0;
 uint32_t activeSessionElapsedBeforeResume = 0;
-uint32_t activeSessionBaseSteps = 0;
+uint32_t activeSessionBaseSteps = 0;   // used for resume-after-reboot base
 int activeSessionFileIdx = -1;
 bool resumeSessionOnBoot = false;
 const unsigned long SESSION_CHECKPOINT_INTERVAL_MS = 10000;
@@ -132,11 +132,15 @@ String buildSessionPayload(const SessionRecord &record)
 String readFileAsString(fs::FS &fs, const char *path)
 {
     if (!fs.exists(path)) {
+        Serial.print("READ: file does not exist: ");
+        Serial.println(path);
         return "";
     }
 
-    fs::File file = fs.open(path);
+    fs::File file = fs.open(path, FILE_READ);
     if (!file || file.isDirectory()) {
+        Serial.print("READ: failed to open file: ");
+        Serial.println(path);
         return "";
     }
 
@@ -209,18 +213,50 @@ void saveRuntimeState(bool sessionActive)
     serialized += "session_id=" + activeSessionId + "\n";
     serialized += "start_time=" + activeSessionStartTime + "\n";
     serialized += "elapsed_s=" + String(activeSessionElapsedBeforeResume) + "\n";
-    serialized += "steps=" + String(activeSessionBaseSteps) + "\n";
     writeFile(LittleFS, SESSION_STATE_PATH, serialized.c_str());
+}
+
+uint32_t getJsonUintValue(const String &json, const char *key)
+{
+    String pattern = String("\"") + key + "\":";
+    int start = json.indexOf(pattern);
+    if (start < 0) {
+        return 0;
+    }
+
+    start += pattern.length();
+
+    while (start < json.length() && isspace(json.charAt(start))) {
+        start++;
+    }
+
+    int end = start;
+    while (end < json.length() && isDigit(json.charAt(end))) {
+        end++;
+    }
+
+    if (end == start) {
+        return 0;
+    }
+
+    return static_cast<uint32_t>(json.substring(start, end).toInt());
 }
 
 void loadRuntimeState()
 {
+    Serial.println("LOAD_STATE: entered");
+
     if (!LittleFS.exists(SESSION_STATE_PATH)) {
+        Serial.println("LOAD_STATE: state file missing, skipping");
         return;
     }
 
     String content = readFileAsString(LittleFS, SESSION_STATE_PATH);
+    Serial.println("LOAD_STATE: raw content:");
+    Serial.println(content);
+
     if (content.length() == 0) {
+        Serial.println("LOAD_STATE: state file empty");
         return;
     }
 
@@ -232,52 +268,66 @@ void loadRuntimeState()
         }
     }
 
-    if (getStateValue(content, "active").toInt() != 1) {
+    String activeRaw = getStateValue(content, "active");
+    Serial.print("LOAD_STATE: active=");
+    Serial.println(activeRaw);
+
+    if (activeRaw.toInt() != 1) {
+        Serial.println("LOAD_STATE: active is not 1");
         return;
     }
 
     int restoredIdx = getStateValue(content, "active_idx").toInt();
+    Serial.print("LOAD_STATE: restoredIdx=");
+    Serial.println(restoredIdx);
+
     if (restoredIdx < 0 || restoredIdx >= MAX_SESSIONS) {
+        Serial.println("LOAD_STATE: active_idx invalid");
         return;
     }
 
     char activePath[20];
     sprintf(activePath, "/session_%d.json", restoredIdx);
+    Serial.print("LOAD_STATE: checking ");
+    Serial.println(activePath);
+
     if (!LittleFS.exists(activePath)) {
+        Serial.println("LOAD_STATE: active session file missing");
+        return;
+    }
+
+    String sessionJson = readFileAsString(LittleFS, activePath);
+    if (sessionJson.length() == 0) {
+        Serial.println("LOAD_STATE: active session file empty");
         return;
     }
 
     activeSessionFileIdx = restoredIdx;
     activeSessionId = getStateValue(content, "session_id");
     activeSessionStartTime = getStateValue(content, "start_time");
-    activeSessionElapsedBeforeResume = static_cast<uint32_t>(getStateValue(content, "elapsed_s").toInt());
-    activeSessionBaseSteps = static_cast<uint32_t>(getStateValue(content, "steps").toInt());
-    // Ensure sensor hardware counter is accounted for: if the hardware counter
-    // contains any counts accumulated while the device was booting (or before
-    // we reset it), add them to the base and then reset the hardware counter.
-    uint32_t hwCounter = 0;
+    activeSessionElapsedBeforeResume =
+        static_cast<uint32_t>(getStateValue(content, "elapsed_s").toInt());
+
+    // Restore step base from the actual checkpoint file, not session_state.txt
+    activeSessionBaseSteps = getJsonUintValue(sessionJson, "steps");
+
+    Serial.print("LOAD_STATE: restored steps from session file=");
+    Serial.println(activeSessionBaseSteps);
+
     if (sensor != nullptr) {
-        hwCounter = sensor->getCounter();
-        if (hwCounter != 0) {
-            Serial.print("LOAD_STATE: hardware counter non-zero on load: ");
-            Serial.println(hwCounter);
-            Serial.print("LOAD_STATE: adding to activeSessionBaseSteps (before)=");
-            Serial.println(activeSessionBaseSteps);
-            activeSessionBaseSteps += hwCounter;
-            Serial.print("LOAD_STATE: activeSessionBaseSteps (after)=");
-            Serial.println(activeSessionBaseSteps);
-        }
-        // Reset the hardware counter so subsequent readings start from zero
         resetStepCount();
         Serial.println("LOAD_STATE: hardware counter reset after restoring state");
     }
+
     activeSessionStartMillis = millis();
-    // Prevent immediate checkpointing flood by initializing checkpoint timestamp
     lastSessionCheckpointAt = millis();
     resumeSessionOnBoot = true;
 
+    Serial.println("LOAD_STATE: resumeSessionOnBoot set to true");
     Serial.print("Resuming active session from file index: ");
     Serial.println(activeSessionFileIdx);
+    Serial.print("Resuming base steps: ");
+    Serial.println(activeSessionBaseSteps);
 }
 
 bool isTouchInsideButton(const TouchButton &button, int16_t x, int16_t y)
@@ -333,31 +383,20 @@ bool touchButtonReleased(const TouchButton &button, bool &touchActive, int16_t &
 
 void initHikeWatch()
 {
-    // LittleFS
     if(!LittleFS.begin(FORMAT_LITTLEFS_IF_FAILED)){
         Serial.println("LittleFS Mount Failed");
         return;
     }
 
-    // Stepcounter
-    // Configure IMU
-    // Enable BMA423 step count feature
-    // Reset steps
-    // Turn on step interrupt
-    // Initialize step counter
     initStepCounter();
 
-    // Side button
     pinMode(AXP202_INT, INPUT_PULLUP);
     attachInterrupt(AXP202_INT, [] {
         irqButton = true;
     }, FALLING);
 
-    //!Clear IRQ unprocessed first
     watch->power->enableIRQ(AXP202_PEK_SHORTPRESS_IRQ, true);
     watch->power->clearIRQ();
-
-    return;
 }
 
 void updateSessionCount() {
@@ -448,9 +487,8 @@ void deleteSession() {
             LittleFS.remove(path);
         }
     }
-    
-    // Force reset variables
-    storedSessionCount = 0; 
+
+    storedSessionCount = 0;
     currentSessionIdx = 0;
     activeSessionFileIdx = -1;
     activeSessionElapsedBeforeResume = 0;
@@ -484,21 +522,19 @@ void setup()
     watch->openBL();
     Serial.println("After watch->openBL()");
 
-    //Receive objects for easy writing
     tft = watch->tft;
     sensor = watch->bma;
-    
+
     tft->fillScreen(TFT_BLACK);
     tft->setTextFont(4);
     tft->setTextSize(1);
     tft->setTextColor(TFT_WHITE, TFT_BLACK);
-    
+
     initHikeWatch();
     updateSessionCount();
     loadRuntimeState();
     state = resumeSessionOnBoot ? 3 : 1;
 
-    // Classic Bluetooth serial
     SerialBT.begin("Hiking Watch");
 
     Serial.println("SETUP DONE");
@@ -510,15 +546,12 @@ void loop()
     {
         case 1:
         {
-            /* Initial stage */
-            updateSessionCount(); 
-            
-            // Clear hardware interrupt state before entering the loop
+            updateSessionCount();
+
             watch->power->readIRQ();
             watch->power->clearIRQ();
             irqButton = false;
 
-            // Draw your original Start Screen
             watch->tft->fillScreen(TFT_BLACK);
             watch->tft->setTextFont(4);
             watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
@@ -532,21 +565,19 @@ void loop()
             int16_t startTouchX = 0;
             int16_t startTouchY = 0;
 
-            while (!exitSync) 
+            while (!exitSync)
             {
-                // Classic Bluetooth sync via SerialBT
                 if (SerialBT.available()) {
                     char incoming = SerialBT.read();
                     if (incoming == 'c' && storedSessionCount > 0 && !sessionSent) {
                         sendNextFinishedSessionBT();
                     }
-                    
+
                     if (incoming == 'r') {
                         Serial.println("Received R - Sync Complete");
                         sessionSent = true;
                         deleteSession();
 
-                        // Reset hardware flags so button works after sync
                         watch->power->readIRQ();
                         watch->power->clearIRQ();
                         irqButton = false;
@@ -565,7 +596,6 @@ void loop()
                         watch->tft->drawString("MEMORY FULL!", 45, 80, 4);
                         watch->tft->drawString("Sync with RPi", 45, 110);
                         delay(3000);
-
                         exitSync = true;
                     } else {
                         state = 2;
@@ -573,44 +603,40 @@ void loop()
                     }
                 }
 
-                /* Button Handling */
                 if (irqButton) {
                     irqButton = false;
-                    watch->power->readIRQ(); // Check hardware register
-                    
-                    // Only process if it's a short press
+                    watch->power->readIRQ();
+
                     if (watch->power->isPEKShortPressIRQ()) {
-                        updateSessionCount(); 
+                        updateSessionCount();
 
                         if (storedSessionCount >= MAX_SESSIONS) {
-                            // Draw Warning without permanently changing UI
                             watch->tft->fillScreen(TFT_RED);
                             watch->tft->setTextColor(TFT_WHITE);
                             watch->tft->drawString("MEMORY FULL!", 45, 80, 4);
                             watch->tft->drawString("Sync with RPi", 45, 110);
-                            delay(3000); 
-                            
-                            exitSync = true; // Redraw the normal black screen
+                            delay(3000);
+                            exitSync = true;
                         } else {
-                            state = 2; // Allow starting hike
+                            state = 2;
                             exitSync = true;
                         }
                     }
-                    watch->power->clearIRQ(); // Important to release the interrupt line
+                    watch->power->clearIRQ();
                 }
-                delay(10); 
+                delay(10);
             }
-            break; 
+            break;
         }
+
         case 2:
         {
-            /* Hiking session initalisation */
             resetStepCount();
             activeSessionId = generateUuidV4();
             activeSessionStartTime = currentIso8601();
             activeSessionStartMillis = millis();
             activeSessionElapsedBeforeResume = 0;
-            activeSessionBaseSteps = 0;
+            activeSessionBaseSteps = 0;   // brand new session starts from zero base
             activeSessionFileIdx = currentSessionIdx;
 
             SessionRecord initialRecord;
@@ -624,18 +650,18 @@ void loop()
 
             saveRuntimeState(true);
             lastSessionCheckpointAt = millis();
-            
+
             state = 3;
             break;
         }
+
         case 3:
         {
-            /* Hiking session ongoing */
             watch->tft->setTextFont(4);
             watch->tft->setTextSize(1);
             watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
             watch->tft->fillScreen(TFT_BLACK);
-            
+
             if (resumeSessionOnBoot) {
                 watch->tft->drawString("Resuming hike", 45, 100);
             } else {
@@ -662,14 +688,12 @@ void loop()
             int16_t endTouchY = 0;
 
             renderSessionMetrics(stepCount);
-            
-            // Ensure IRQ is clean before starting the loop
+
             watch->power->readIRQ();
             watch->power->clearIRQ();
-            irqButton = false; 
+            irqButton = false;
 
             while (state == 3) {
-                // Handle Step Interrupt
                 if (irqBMA) {
                     Serial.println("MAIN: irqBMA true - handling step interrupt");
                     irqBMA = false;
@@ -684,6 +708,7 @@ void loop()
                         Serial.println("MAIN: irqBMA but no step counter interrupt reported by sensor");
                     }
                 }
+
                 if (touchButtonReleased(END_TOUCH_BUTTON, endTouchActive, endTouchX, endTouchY)) {
                     SessionRecord record;
                     record.sessionId = activeSessionId;
@@ -704,20 +729,16 @@ void loop()
                     resumeSessionOnBoot = false;
 
                     saveRuntimeState(false);
-
                     updateSessionCount();
 
                     state = 4;
                 }
 
-                // Handle Button Press to END session
                 if (irqButton) {
                     irqButton = false;
                     watch->power->readIRQ();
-                    
-                    // Only act if it was a short press
+
                     if (watch->power->isPEKShortPressIRQ()) {
-                        // 1. Save using the current index
                         SessionRecord record;
                         record.sessionId = activeSessionId;
                         record.startTime = activeSessionStartTime;
@@ -727,8 +748,7 @@ void loop()
                         record.durationSeconds = activeSessionElapsedBeforeResume + ((millis() - activeSessionStartMillis) / 1000);
 
                         saveSessionData(activeSessionFileIdx, record);
-                        
-                        // 2. Increment index for NEXT time (FIFO)
+
                         currentSessionIdx = activeSessionFileIdx + 1;
                         if (currentSessionIdx >= MAX_SESSIONS) currentSessionIdx = 0;
 
@@ -738,11 +758,9 @@ void loop()
                         resumeSessionOnBoot = false;
 
                         saveRuntimeState(false);
-
-                        // 3. Update the total count for Case 1 guard
                         updateSessionCount();
-                        
-                        state = 4; // Move to save/exit state
+
+                        state = 4;
                     }
                     watch->power->clearIRQ();
                 }
@@ -762,33 +780,27 @@ void loop()
                     Serial.print("MAIN: checkpoint saved, stepCount=");
                     Serial.println(stepCount);
 
-                    activeSessionBaseSteps = stepCount;
+                    // Save the latest checkpointed total for reboot recovery.
+                    // Do NOT reset the hardware counter here.
                     activeSessionElapsedBeforeResume = elapsed;
-                    activeSessionStartMillis = millis();
-                    // Reset the sensor hardware counter after taking a checkpoint. The
-                    // code uses: total_steps = activeSessionBaseSteps + sensor->getCounter();
-                    // If we don't reset the hardware counter here, sensor->getCounter()
-                    // remains cumulative and the next calculation will double-count.
-                    resetStepCount();
-                    Serial.println("MAIN: resetStepCount called after checkpoint");
                     saveRuntimeState(true);
                     lastSessionCheckpointAt = millis();
                 }
 
-                delay(50); // Small delay to prevent CPU hogging
+                delay(50);
             }
-            break; 
-        }
-        case 4:
-        {
-            //Save hiking session data
-            delay(1000);
-            state = 1;  
             break;
         }
+
+        case 4:
+        {
+            delay(1000);
+            state = 1;
+            break;
+        }
+
         default:
         {
-            // Restart watch
             ESP.restart();
         }
     }
