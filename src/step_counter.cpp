@@ -1,4 +1,4 @@
-#include "stepCounter.h"
+#include "step_counter.h"
 
 // Global variables
 uint32_t currentStepCount = 0;
