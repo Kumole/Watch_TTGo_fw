@@ -4,8 +4,10 @@ After=multi-user.target
 
 [Service]
 Type=idle
-User=pi # Replace with your username
-ExecStart=/usr/bin/python3 /home/johannes/hiking-assistant-server/run.py      # Replace with path to your run.py
+User=user
+User=user
+WorkingDirectory=/home/user/latest
+ExecStart=/bin/bash -lc 'source /home/user/latest/.venv/bin/activate && exec flask run'
 Restart=always
 
 [Install]
@@ -16,7 +18,7 @@ WantedBy=multi-user.target
 
 
 # Steps:
-# Place in lib/systemd/system/startup_webserver.service
-# sudo systemctl deamon-reload
+# Place in /lib/systemd/system/startup_webserver.service
+# sudo systemctl daemon-reload
 # sudo systemctl enable startup_webserver.service
 # sudo systemctl start startup_webserver.service
