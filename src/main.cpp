@@ -3,6 +3,8 @@
 #include <BluetoothSerial.h>
 #include <esp_system.h>
 #include <time.h>
+#include <limits.h>
+#include <sys/time.h>
 
 // Check if Bluetooth configs are enabled
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
@@ -53,22 +55,28 @@ struct TouchButton {
 };
 
 const TouchButton START_TOUCH_BUTTON = {40, 150, 160, 50, TFT_DARKGREEN, TFT_WHITE, "Start session"};
-const TouchButton END_TOUCH_BUTTON = {40, 170, 160, 50, TFT_RED, TFT_WHITE, "End session"};
+const TouchButton END_TOUCH_BUTTON = {40, 190, 160, 40, TFT_RED, TFT_WHITE, "End session"};
 
 const int16_t STEPS_LABEL_X = 45;
-const int16_t STEPS_Y = 70;
+const int16_t STEPS_Y = 78;
 const int16_t STEPS_VALUE_X = 120;
+
 const int16_t DIST_LABEL_X = 45;
-const int16_t DIST_Y = 100;
+const int16_t DIST_Y = 108;
 const int16_t DIST_VALUE_X = 95;
+
+const int16_t DUR_LABEL_X = 45;
+const int16_t DUR_Y = 138;
+const int16_t DUR_VALUE_X = 120;
 
 int currentSessionIdx = 0;
 int storedSessionCount = 0;
 const int MAX_SESSIONS = 100;
 const char *SESSION_STATE_PATH = "/session_state.txt";
-
 bool waitingForAck = false;
 String pendingSessionId = "";
+bool clockSynced = false;
+unsigned long lastRenderedClockEpoch = ULONG_MAX;
 
 // Timer variables
 unsigned long last = 0;
@@ -113,9 +121,76 @@ String currentIso8601()
     return String(timestamp);
 }
 
+
+bool isClockCurrentlyValid()
+{
+    time_t now = time(nullptr);
+    return clockSynced && now >= 946684800;
+}
+
+String getClockDisplayText()
+{
+    if (!isClockCurrentlyValid()) {
+        return "Time: --:--:--";
+    }
+
+    time_t now = time(nullptr);
+    struct tm localTime;
+    localtime_r(&now, &localTime);
+
+    char buffer[20];
+    strftime(buffer, sizeof(buffer), "Time: %H:%M:%S", &localTime);
+    return String(buffer);
+}
+
+void drawClockBanner(bool force = false)
+{
+    time_t now = time(nullptr);
+    unsigned long nowEpoch = (now >= 0) ? static_cast<unsigned long>(now) : 0;
+    if (!force && nowEpoch == lastRenderedClockEpoch) {
+        return;
+    }
+
+    lastRenderedClockEpoch = nowEpoch;
+    tft->fillRect(0, 0, 240, 22, TFT_BLACK);
+    tft->setTextColor(isClockCurrentlyValid() ? TFT_CYAN : TFT_YELLOW, TFT_BLACK);
+    tft->drawCentreString(getClockDisplayText(), 120, 4, 2);
+    tft->setTextColor(TFT_WHITE, TFT_BLACK);
+}
+
+bool syncClockFromUnixEpoch(time_t epochSeconds)
+{
+    if (epochSeconds < 946684800) {
+        Serial.println("TIME_SYNC: rejected invalid epoch");
+        return false;
+    }
+
+    struct timeval tv;
+    tv.tv_sec = epochSeconds;
+    tv.tv_usec = 0;
+
+    if (settimeofday(&tv, nullptr) != 0) {
+        Serial.println("TIME_SYNC: settimeofday failed");
+        return false;
+    }
+
+    clockSynced = true;
+    lastRenderedClockEpoch = ULONG_MAX;
+
+    Serial.print("TIME_SYNC: clock synced to epoch ");
+    Serial.println(static_cast<unsigned long>(epochSeconds));
+    return true;
+}
+
 uint32_t stepsToMeters(uint32_t steps)
 {
     return static_cast<uint32_t>((static_cast<uint64_t>(steps) * 1000ULL) / STEPS_PER_KM);
+}
+
+uint32_t getCurrentElapsedSeconds()
+{
+    return activeSessionElapsedBeforeResume +
+           static_cast<uint32_t>((millis() - activeSessionStartMillis) / 1000);
 }
 
 String buildSessionPayload(const SessionRecord &record)
@@ -127,6 +202,8 @@ String buildSessionPayload(const SessionRecord &record)
     json += "\"steps\":" + String(record.steps) + ",";
     json += "\"distance_m\":" + String(record.distanceMeters) + ",";
     json += "\"duration_s\":" + String(record.durationSeconds) + ",";
+    json += "\"clock_synced\":" + String(isClockCurrentlyValid() ? "true" : "false") + ",";
+    json += "\"protocol_version\":" + String(WATCH_BT_PROTOCOL_VERSION) + ",";
     json += "\"in_progress\":" + String(record.endTime.length() == 0 ? "true" : "false");
     json += "}";
     return json;
@@ -356,19 +433,38 @@ void drawTouchButton(const TouchButton &button)
     tft->setTextColor(TFT_WHITE, TFT_BLACK);
 }
 
-void renderSessionMetrics(uint32_t stepCount)
+void renderSessionMetrics(uint32_t stepCount, uint32_t durationSeconds)
 {
-    float distanceKm = stepsToKilometers(stepCount);
+    float distanceKm = static_cast<float>(stepsToMeters(stepCount)) / 1000.0f;
+
+    uint32_t hours = durationSeconds / 3600;
+    uint32_t minutes = (durationSeconds % 3600) / 60;
+    uint32_t seconds = durationSeconds % 60;
+
+    char durationBuf[16];
+    snprintf(
+        durationBuf,
+        sizeof(durationBuf),
+        "%02lu:%02lu:%02lu",
+        static_cast<unsigned long>(hours),
+        static_cast<unsigned long>(minutes),
+        static_cast<unsigned long>(seconds)
+    );
 
     tft->setTextColor(TFT_WHITE, TFT_BLACK);
+
+    tft->fillRect(STEPS_VALUE_X, STEPS_Y, 120, 20, TFT_BLACK);
     tft->setCursor(STEPS_VALUE_X, STEPS_Y);
     tft->print(stepCount);
-    tft->print("   ");
 
-    tft->fillRect(DIST_VALUE_X, DIST_Y, 110, 20, TFT_BLACK);
+    tft->fillRect(DIST_VALUE_X, DIST_Y, 130, 20, TFT_BLACK);
     tft->setCursor(DIST_VALUE_X, DIST_Y);
-    tft->print(distanceKm, 1);
+    tft->print(distanceKm, 2);
     tft->print(" km");
+
+    tft->fillRect(DUR_VALUE_X, DUR_Y, 110, 20, TFT_BLACK);
+    tft->setCursor(DUR_VALUE_X, DUR_Y);
+    tft->print(durationBuf);
 }
 
 bool touchButtonReleased(const TouchButton &button, bool &touchActive, int16_t &lastTouchX, int16_t &lastTouchY)
@@ -394,7 +490,7 @@ bool touchButtonReleased(const TouchButton &button, bool &touchActive, int16_t &
 
 void initHikeWatch()
 {
-    if(!LittleFS.begin(FORMAT_LITTLEFS_IF_FAILED)){
+    if (!LittleFS.begin(FORMAT_LITTLEFS_IF_FAILED)) {
         Serial.println("LittleFS Mount Failed");
         return;
     }
@@ -410,7 +506,8 @@ void initHikeWatch()
     watch->power->clearIRQ();
 }
 
-void updateSessionCount() {
+void updateSessionCount()
+{
     storedSessionCount = 0;
     int highestSessionIdx = -1;
 
@@ -445,7 +542,14 @@ void updateSessionCount() {
     Serial.println(currentSessionIdx);
 }
 
-bool sendNextFinishedSessionBT() {
+void sendBluetoothLine(const String &line)
+{
+    SerialBT.print(line);
+    SerialBT.print('\n');
+}
+
+bool sendNextFinishedSessionBT()
+{
     if (storedSessionCount == 0 || waitingForAck) {
         return false;
     }
@@ -479,8 +583,7 @@ bool sendNextFinishedSessionBT() {
                 Serial.print("SYNC: sending one session from ");
                 Serial.println(path);
 
-                SerialBT.print(payload);
-                SerialBT.print('\n');
+                sendBluetoothLine("SESSION|" + payload);
 
                 waitingForAck = true;
                 pendingSessionId = sessionId;
@@ -499,7 +602,8 @@ bool sendNextFinishedSessionBT() {
     return false;
 }
 
-void saveSessionData(int idx, const SessionRecord &record) {
+void saveSessionData(int idx, const SessionRecord &record)
+{
     char path[20];
 
     sprintf(path, "/session_%d.json", idx);
@@ -508,7 +612,8 @@ void saveSessionData(int idx, const SessionRecord &record) {
     writeFile(LittleFS, path, payload.c_str());
 }
 
-bool deleteSessionById(const String &sessionId) {
+bool deleteSessionById(const String &sessionId)
+{
     fs::File root = LittleFS.open("/");
     if (!root || !root.isDirectory()) {
         Serial.println("SYNC: failed to open LittleFS root for delete");
@@ -576,9 +681,10 @@ void setup()
     initHikeWatch();
     updateSessionCount();
     loadRuntimeState();
+    clockSynced = false;
     state = resumeSessionOnBoot ? 3 : 1;
 
-    SerialBT.begin("Hiking Watch");
+    SerialBT.begin(WATCH_BLUETOOTH_NAME);
 
     Serial.println("SETUP DONE");
 }
@@ -598,6 +704,7 @@ void loop()
             watch->tft->fillScreen(TFT_BLACK);
             watch->tft->setTextFont(4);
             watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
+            drawClockBanner(true);
             watch->tft->drawString("Hiking Assistant", 25, 25, 4);
             watch->tft->drawString("Press side button", 18, 80);
             watch->tft->drawString("or tap screen", 37, 110);
@@ -610,6 +717,8 @@ void loop()
 
             while (!exitSync)
             {
+                drawClockBanner();
+
                 if (SerialBT.available()) {
                     String incoming = SerialBT.readStringUntil('\n');
                     incoming.trim();
@@ -619,19 +728,30 @@ void loop()
                         Serial.println(incoming);
                     }
 
-                    if (incoming == "c") {
+                    if (incoming.startsWith("TIME_SYNC|")) {
+                        String epochRaw = incoming.substring(String("TIME_SYNC|").length());
+                        epochRaw.trim();
+                        time_t epochSeconds = static_cast<time_t>(epochRaw.toInt());
+
+                        if (syncClockFromUnixEpoch(epochSeconds)) {
+                            sendBluetoothLine("TIME_SYNC_ACK|" + String(static_cast<unsigned long>(epochSeconds)));
+                        } else {
+                            sendBluetoothLine("TIME_SYNC_NACK|invalid_epoch");
+                        }
+                    }
+                    else if (incoming == "SYNC_PULL") {
                         if (!waitingForAck) {
                             sendNextFinishedSessionBT();
                         } else {
-                            Serial.println("SYNC: ignoring c while waiting for ack");
+                            Serial.println("SYNC: ignoring SYNC_PULL while waiting for ack");
                         }
                     }
-                    else if (incoming.startsWith("a:")) {
-                        String ackId = incoming.substring(2);
+                    else if (incoming.startsWith("SESSION_ACK|")) {
+                        String ackId = incoming.substring(String("SESSION_ACK|").length());
                         ackId.trim();
 
                         if (!waitingForAck) {
-                            Serial.println("SYNC: ignoring unexpected ack");
+                            Serial.println("SYNC: ignoring unexpected session ack");
                         } else if (ackId != pendingSessionId) {
                             Serial.println("SYNC: ignoring ack for non-pending session");
                         } else {
@@ -647,13 +767,18 @@ void loop()
                                     watch->power->clearIRQ();
                                     irqButton = false;
 
+                                    sendBluetoothLine("SYNC_DONE");
                                     exitSync = true;
                                     break;
                                 }
                             }
                         }
                     }
+                    else if (incoming.startsWith("HELLO|")) {
+                        sendBluetoothLine("HELLO_ACK|" + String(WATCH_BT_PROTOCOL_VERSION));
+                    }
                 }
+
                 if (touchButtonReleased(START_TOUCH_BUTTON, startTouchActive, startTouchX, startTouchY)) {
                     updateSessionCount();
 
@@ -663,6 +788,15 @@ void loop()
                         watch->tft->drawString("MEMORY FULL!", 45, 80, 4);
                         watch->tft->drawString("Sync with RPi", 45, 110);
                         delay(3000);
+                        exitSync = true;
+                    } else if (!clockSynced) {
+                        watch->tft->fillScreen(TFT_BLACK);
+                        drawClockBanner(true);
+                        watch->tft->setTextColor(TFT_YELLOW, TFT_BLACK);
+                        watch->tft->drawString("Clock not synced", 28, 90, 4);
+                        watch->tft->drawString("Connect to RPi", 38, 120, 2);
+                        watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
+                        delay(2000);
                         exitSync = true;
                     } else {
                         state = 2;
@@ -684,6 +818,15 @@ void loop()
                             watch->tft->drawString("Sync with RPi", 45, 110);
                             delay(3000);
                             exitSync = true;
+                        } else if (!clockSynced) {
+                            watch->tft->fillScreen(TFT_BLACK);
+                            drawClockBanner(true);
+                            watch->tft->setTextColor(TFT_YELLOW, TFT_BLACK);
+                            watch->tft->drawString("Clock not synced", 28, 90, 4);
+                            watch->tft->drawString("Connect to RPi", 38, 120, 2);
+                            watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
+                            delay(2000);
+                            exitSync = true;
                         } else {
                             state = 2;
                             exitSync = true;
@@ -691,6 +834,7 @@ void loop()
                     }
                     watch->power->clearIRQ();
                 }
+
                 delay(10);
             }
             break;
@@ -731,6 +875,8 @@ void loop()
             watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
             watch->tft->fillScreen(TFT_BLACK);
 
+            drawClockBanner(true);
+
             if (resumeSessionOnBoot) {
                 watch->tft->drawString("Resuming hike", 45, 100);
             } else {
@@ -740,11 +886,14 @@ void loop()
             watch->tft->fillScreen(TFT_BLACK);
 
             watch->tft->setCursor(STEPS_LABEL_X, STEPS_Y);
-            watch->tft->print("Steps: 0");
+            watch->tft->print("Steps:");
 
             watch->tft->setCursor(DIST_LABEL_X, DIST_Y);
-            watch->tft->print("Dist: 0.0 km");
-            watch->tft->setCursor(30, 140);
+            watch->tft->print("Dist:");
+
+            watch->tft->setCursor(DUR_LABEL_X, DUR_Y);
+            watch->tft->print("Time:");
+
             drawTouchButton(END_TOUCH_BUTTON);
 
             if (activeSessionFileIdx < 0 || activeSessionFileIdx >= MAX_SESSIONS) {
@@ -752,17 +901,29 @@ void loop()
             }
 
             uint32_t stepCount = activeSessionBaseSteps + sensor->getCounter();
+            uint32_t initialElapsed = getCurrentElapsedSeconds();
+            uint32_t lastRenderedElapsed = UINT32_MAX;
+
             bool endTouchActive = false;
             int16_t endTouchX = 0;
             int16_t endTouchY = 0;
 
-            renderSessionMetrics(stepCount);
+            renderSessionMetrics(stepCount, initialElapsed);
+            lastRenderedElapsed = initialElapsed;
 
             watch->power->readIRQ();
             watch->power->clearIRQ();
             irqButton = false;
 
             while (state == 3) {
+                drawClockBanner();
+                uint32_t elapsedNow = getCurrentElapsedSeconds();
+
+                if (elapsedNow != lastRenderedElapsed) {
+                    renderSessionMetrics(stepCount, elapsedNow);
+                    lastRenderedElapsed = elapsedNow;
+                }
+
                 if (irqBMA) {
                     Serial.println("MAIN: irqBMA true - handling step interrupt");
                     irqBMA = false;
@@ -772,7 +933,7 @@ void loop()
                         Serial.println(sensor->getCounter());
                         Serial.print("MAIN: computed stepCount=");
                         Serial.println(stepCount);
-                        renderSessionMetrics(stepCount);
+                        renderSessionMetrics(stepCount, elapsedNow);
                     } else {
                         Serial.println("MAIN: irqBMA but no step counter interrupt reported by sensor");
                     }
@@ -785,7 +946,7 @@ void loop()
                     record.endTime = currentIso8601();
                     record.steps = stepCount;
                     record.distanceMeters = stepsToMeters(stepCount);
-                    record.durationSeconds = activeSessionElapsedBeforeResume + ((millis() - activeSessionStartMillis) / 1000);
+                    record.durationSeconds = getCurrentElapsedSeconds();
 
                     saveSessionData(activeSessionFileIdx, record);
 
@@ -814,7 +975,7 @@ void loop()
                         record.endTime = currentIso8601();
                         record.steps = stepCount;
                         record.distanceMeters = stepsToMeters(stepCount);
-                        record.durationSeconds = activeSessionElapsedBeforeResume + ((millis() - activeSessionStartMillis) / 1000);
+                        record.durationSeconds = getCurrentElapsedSeconds();
 
                         saveSessionData(activeSessionFileIdx, record);
 
@@ -835,7 +996,7 @@ void loop()
                 }
 
                 if (state == 3 && (millis() - lastSessionCheckpointAt) >= SESSION_CHECKPOINT_INTERVAL_MS) {
-                    uint32_t elapsed = activeSessionElapsedBeforeResume + ((millis() - activeSessionStartMillis) / 1000);
+                    uint32_t elapsed = getCurrentElapsedSeconds();
 
                     SessionRecord checkpoint;
                     checkpoint.sessionId = activeSessionId;
@@ -849,11 +1010,12 @@ void loop()
                     Serial.print("MAIN: checkpoint saved, stepCount=");
                     Serial.println(stepCount);
 
-                    // Save the latest checkpointed total for reboot recovery.
+                    // Save the latest checkpointed elapsed time for reboot recovery.
                     // Do NOT reset the hardware counter here.
                     activeSessionElapsedBeforeResume = elapsed;
+                    activeSessionStartMillis = millis();
                     saveRuntimeState(true);
-                    lastSessionCheckpointAt = millis();
+                    lastSessionCheckpointAt = activeSessionStartMillis;
                 }
 
                 delay(50);
