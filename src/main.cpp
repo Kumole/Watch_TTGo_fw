@@ -1003,19 +1003,18 @@ void loop()
             watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
             watch->tft->fillScreen(TFT_BLACK);
 
-            drawClockBanner(true);
-
             if (resumeSessionOnBoot) {
+                drawClockBanner(true);
                 watch->tft->drawString("Resuming hike", 45, 100);
                 delay(1000);
                 resumeSessionOnBoot = false;
             } else {
+                drawClockBanner(true);
                 watch->tft->drawString("Starting hike", 45, 100);
                 delay(1000);
             }
 
             watch->tft->fillScreen(TFT_BLACK);
-            drawClockBanner(true);
 
             watch->tft->setCursor(STEPS_LABEL_X, STEPS_Y);
             watch->tft->print("Steps:");
@@ -1036,15 +1035,34 @@ void loop()
             int16_t endTouchX = 0;
             int16_t endTouchY = 0;
 
+            time_t lastRenderedEpochSecond = -1;
+            uint32_t lastRenderedSteps = UINT32_MAX;
+            uint32_t lastRenderedDuration = UINT32_MAX;
+
             while (state == WatchState::SESSION_ACTIVE)
             {
-                drawClockBanner();
-                
                 handleStepCounterInterrupt();
 
-                uint32_t stepCount = activeSessionBaseSteps + static_cast<uint32_t>(getStepCount());
+                uint32_t stepCount =
+                    activeSessionBaseSteps + static_cast<uint32_t>(getStepCount());
                 uint32_t durationSeconds = getCurrentElapsedSeconds();
-                renderSessionMetrics(stepCount, durationSeconds);
+                time_t nowEpoch = time(nullptr);
+
+                bool shouldRedrawClock = (nowEpoch != lastRenderedEpochSecond);
+                bool shouldRedrawMetrics =
+                    (stepCount != lastRenderedSteps) ||
+                    (durationSeconds != lastRenderedDuration);
+
+                if (shouldRedrawClock) {
+                    drawClockBanner(true);
+                    lastRenderedEpochSecond = nowEpoch;
+                }
+
+                if (shouldRedrawMetrics) {
+                    renderSessionMetrics(stepCount, durationSeconds);
+                    lastRenderedSteps = stepCount;
+                    lastRenderedDuration = durationSeconds;
+                }
 
                 checkpointActiveSessionIfNeeded();
                 pollBluetooth();
@@ -1067,7 +1085,7 @@ void loop()
                     watch->power->clearIRQ();
                 }
 
-                delay(100);
+                delay(30);
             }
 
             break;
