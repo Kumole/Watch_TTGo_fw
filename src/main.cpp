@@ -32,8 +32,6 @@ volatile uint8_t state;
 volatile bool irqBMA = false;
 volatile bool irqButton = false;
 
-bool sessionSent = false;
-
 String activeSessionId;
 String activeSessionStartTime;
 unsigned long activeSessionStartMillis = 0;
@@ -740,7 +738,10 @@ void loop()
                     }
                     else if (incoming == "SYNC_PULL") {
                         if (!waitingForAck) {
-                            sendNextFinishedSessionBT();
+                            if (!sendNextFinishedSessionBT()) {
+                                Serial.println("SYNC: nothing to send, reporting completion");
+                                sendBluetoothLine("SYNC_DONE");
+                            }
                         } else {
                             Serial.println("SYNC: ignoring SYNC_PULL while waiting for ack");
                         }
@@ -760,8 +761,6 @@ void loop()
 
                                 if (!sendNextFinishedSessionBT()) {
                                     Serial.println("SYNC: all finished sessions acknowledged");
-                                    sessionSent = true;
-
                                     watch->power->readIRQ();
                                     watch->power->clearIRQ();
                                     irqButton = false;
