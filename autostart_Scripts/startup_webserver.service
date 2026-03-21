@@ -6,7 +6,7 @@ After=multi-user.target
 Type=idle
 User=user
 User=user
-WorkingDirectory=/home/user/latest
+WorkingDirectory=/home/user/latest/server
 ExecStart=/bin/bash -lc 'source /home/user/latest/.venv/bin/activate && exec flask run'
 Restart=always
 

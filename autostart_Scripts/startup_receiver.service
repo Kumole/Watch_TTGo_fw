@@ -5,8 +5,8 @@ After=multi-user.target
 [Service]
 Type=idle
 User=user
-WorkingDirectory=/home/user/latest
-ExecStart=/bin/bash -lc 'source /home/user/latest/.venv/bin/activate && exec python3 receiver/rpi/receiver.py'
+WorkingDirectory=/home/user/latest/receiver/rpi
+ExecStart=/bin/bash -lc 'source /home/user/latest/.venv/bin/activate && exec python3 receiver.py'
 Restart=always
 
 [Install]
