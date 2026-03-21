@@ -1039,6 +1039,8 @@ void loop()
             while (state == WatchState::SESSION_ACTIVE)
             {
                 drawClockBanner();
+                
+                handleStepCounterInterrupt();
 
                 uint32_t stepCount = activeSessionBaseSteps + static_cast<uint32_t>(getStepCount());
                 uint32_t durationSeconds = getCurrentElapsedSeconds();
