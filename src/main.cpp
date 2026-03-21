@@ -54,20 +54,19 @@ struct TouchButton {
     const char *label;
 };
 
-const TouchButton START_TOUCH_BUTTON = {40, 150, 160, 50, TFT_DARKGREEN, TFT_WHITE, "Start session"};
-const TouchButton END_TOUCH_BUTTON = {40, 190, 160, 40, TFT_RED, TFT_WHITE, "End session"};
+const TouchButton START_TOUCH_BUTTON = {30, 145, 180, 60, TFT_DARKGREEN, TFT_WHITE, "Start session"};
+const TouchButton END_TOUCH_BUTTON   = {30, 185, 180, 50, TFT_RED, TFT_WHITE, "End session"};
 
 const int16_t STEPS_LABEL_X = 45;
 const int16_t STEPS_Y = 78;
-const int16_t STEPS_VALUE_X = 120;
 
 const int16_t DIST_LABEL_X = 45;
 const int16_t DIST_Y = 108;
-const int16_t DIST_VALUE_X = 95;
 
 const int16_t DUR_LABEL_X = 45;
 const int16_t DUR_Y = 138;
-const int16_t DUR_VALUE_X = 120;
+
+const int16_t METRIC_VALUE_X = 125;
 
 int currentSessionIdx = 0;
 int storedSessionCount = 0;
@@ -152,9 +151,9 @@ void drawClockBanner(bool force = false)
     }
 
     lastRenderedClockEpoch = nowEpoch;
-    tft->fillRect(0, 0, 240, 22, TFT_BLACK);
+    tft->fillRect(0, 0, 240, 30, TFT_BLACK);
     tft->setTextColor(isClockCurrentlyValid() ? TFT_CYAN : TFT_YELLOW, TFT_BLACK);
-    tft->drawCentreString(getClockDisplayText(), 120, 4, 2);
+    tft->drawCentreString(getClockDisplayText(), 120, 6, 4);
     tft->setTextColor(TFT_WHITE, TFT_BLACK);
 }
 
@@ -429,7 +428,7 @@ void drawTouchButton(const TouchButton &button)
     tft->fillRoundRect(button.x, button.y, button.w, button.h, 10, button.fillColor);
     tft->drawRoundRect(button.x, button.y, button.w, button.h, 10, TFT_WHITE);
     tft->setTextColor(button.textColor, button.fillColor);
-    tft->drawCentreString(button.label, button.x + (button.w / 2), button.y + 16, 2);
+    tft->drawCentreString(button.label, button.x + (button.w / 2), button.y + 18, 4);
     tft->setTextColor(TFT_WHITE, TFT_BLACK);
 }
 
@@ -453,17 +452,17 @@ void renderSessionMetrics(uint32_t stepCount, uint32_t durationSeconds)
 
     tft->setTextColor(TFT_WHITE, TFT_BLACK);
 
-    tft->fillRect(STEPS_VALUE_X, STEPS_Y, 120, 20, TFT_BLACK);
-    tft->setCursor(STEPS_VALUE_X, STEPS_Y);
+    tft->fillRect(METRIC_VALUE_X, STEPS_Y, 100, 20, TFT_BLACK);
+    tft->setCursor(METRIC_VALUE_X, STEPS_Y);
     tft->print(stepCount);
 
-    tft->fillRect(DIST_VALUE_X, DIST_Y, 130, 20, TFT_BLACK);
-    tft->setCursor(DIST_VALUE_X, DIST_Y);
+    tft->fillRect(METRIC_VALUE_X, DIST_Y, 100, 20, TFT_BLACK);
+    tft->setCursor(METRIC_VALUE_X, DIST_Y);
     tft->print(distanceKm, 2);
     tft->print(" km");
 
-    tft->fillRect(DUR_VALUE_X, DUR_Y, 110, 20, TFT_BLACK);
-    tft->setCursor(DUR_VALUE_X, DUR_Y);
+    tft->fillRect(METRIC_VALUE_X, DUR_Y, 100, 20, TFT_BLACK);
+    tft->setCursor(METRIC_VALUE_X, DUR_Y);
     tft->print(durationBuf);
 }
 
@@ -705,9 +704,9 @@ void loop()
             watch->tft->setTextFont(4);
             watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
             drawClockBanner(true);
-            watch->tft->drawString("Hiking Assistant", 25, 25, 4);
-            watch->tft->drawString("Press side button", 18, 80);
-            watch->tft->drawString("or tap screen", 37, 110);
+            watch->tft->drawString("Hiking Assistant", 25, 35, 4);
+            watch->tft->drawString("Press side button", 18, 88);
+            watch->tft->drawString("or tap screen", 37, 118);
             drawTouchButton(START_TOUCH_BUTTON);
 
             bool exitSync = false;
