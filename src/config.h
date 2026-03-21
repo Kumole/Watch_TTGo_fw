@@ -1,3 +1,6 @@
+#ifndef CONFIG_H
+#define CONFIG_H
+
 #include <Arduino.h>
 
 // => Hardware select
@@ -10,3 +13,8 @@
 #include <stdlib.h>
 #include <cmath>
 #include "utils.h"
+
+static constexpr const char *WATCH_BLUETOOTH_NAME = "Hiking Watch";
+static constexpr uint32_t WATCH_BT_PROTOCOL_VERSION = 2;
+
+#endif
