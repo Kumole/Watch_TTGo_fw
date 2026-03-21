@@ -1,0 +1,12 @@
+[Unit]
+Description=Starup script for Hiking Assistant BLuetooth Reciever
+After=multi-user.target
+
+[Service]
+Type=idle
+User=pi # Replace with your username
+ExecStart=/usr/bin/python3 /home/johannes/Watch_TTGo_fw/"RPi py files"/receiver.py      # Replace with path to your reciever.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

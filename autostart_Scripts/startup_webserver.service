@@ -1,0 +1,12 @@
+[Unit]
+Description=Starup script for Hiking Assistant Web-server
+After=multi-user.target
+
+[Service]
+Type=idle
+User=pi # Replace with your username
+ExecStart=/usr/bin/python3 /home/johannes/hiking-assistant-server/run.py      # Replace with path to your run.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
