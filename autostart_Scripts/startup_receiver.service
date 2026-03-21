@@ -1,13 +1,16 @@
 [Unit]
 Description=Startup script for Hiking Assistant Bluetooth Receiver
-After=multi-user.target
+After=network.target
 
 [Service]
-Type=idle
+Type=simple
 User=user
 WorkingDirectory=/home/user/latest/receiver/rpi
-ExecStart=/bin/bash -lc 'source /home/user/latest/.venv/bin/activate && exec python3 receiver.py'
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/user/latest/.venv/bin/python3 receiver.py
 Restart=always
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
