@@ -29,13 +29,17 @@ struct SessionRecord {
 };
 
 enum class WatchState : uint8_t {
-    IDLE = 1,
-    SESSION_STARTING = 2,
-    SESSION_ACTIVE = 3,
-    RESUME_NEEDS_TIME_SYNC = 4
+    BOOTING = 0,
+    IDLE_UNSYNCED = 1,
+    IDLE_READY = 2,
+    RESUME_PENDING_TIME_SYNC = 3,
+    SESSION_STARTING = 4,
+    SESSION_ACTIVE = 5,
+    SESSION_ENDING = 6,
+    SESSION_SAVED = 7
 };
 
-volatile WatchState state = WatchState::IDLE;
+volatile WatchState state = WatchState::BOOTING;
 volatile bool irqBMA = false;
 volatile bool irqButton = false;
 
@@ -194,6 +198,23 @@ uint32_t getCurrentElapsedSeconds()
 {
     return activeSessionElapsedBeforeResume +
            static_cast<uint32_t>((millis() - activeSessionStartMillis) / 1000);
+}
+
+bool canStartSession()
+{
+    return storedSessionCount < MAX_SESSIONS && isClockCurrentlyValid();
+}
+
+WatchState getIdleStateFromClock()
+{
+    return isClockCurrentlyValid()
+        ? WatchState::IDLE_READY
+        : WatchState::IDLE_UNSYNCED;
+}
+
+void transitionToIdleState()
+{
+    state = getIdleStateFromClock();
 }
 
 String buildSessionPayload(const SessionRecord &record)
@@ -668,10 +689,12 @@ bool handleBluetoothCommand(const String &incoming)
         if (syncClockFromUnixEpoch(epochSeconds)) {
             sendBluetoothLine("TIME_SYNC_ACK|" + String(static_cast<unsigned long>(epochSeconds)));
 
-            if (state == WatchState::RESUME_NEEDS_TIME_SYNC) {
+            if (state == WatchState::RESUME_PENDING_TIME_SYNC) {
                 activeSessionStartMillis = millis();
                 lastSessionCheckpointAt = millis();
                 state = WatchState::SESSION_ACTIVE;
+            } else if (state == WatchState::IDLE_UNSYNCED) {
+                state = WatchState::IDLE_READY;
             }
         } else {
             sendBluetoothLine("TIME_SYNC_NACK|invalid_epoch");
@@ -783,9 +806,7 @@ void beginNewSession()
 
     saveRuntimeState(true);
     lastSessionCheckpointAt = millis();
-
     resumeSessionOnBoot = false;
-    state = WatchState::SESSION_ACTIVE;
 }
 
 void finalizeSession()
@@ -817,13 +838,6 @@ void finalizeSession()
 
     saveRuntimeState(false);
     updateSessionCount();
-
-    watch->tft->fillScreen(TFT_BLACK);
-    drawClockBanner(true);
-    watch->tft->drawString("Session saved", 45, 100, 4);
-    delay(1000);
-
-    state = WatchState::IDLE;
 }
 
 void checkpointActiveSessionIfNeeded()
@@ -880,9 +894,12 @@ void setup()
     loadRuntimeState();
 
     clockSynced = false;
-    state = resumeSessionOnBoot
-        ? WatchState::RESUME_NEEDS_TIME_SYNC
-        : WatchState::IDLE;
+
+    if (resumeSessionOnBoot) {
+        state = WatchState::RESUME_PENDING_TIME_SYNC;
+    } else {
+        state = WatchState::IDLE_UNSYNCED;
+    }
 
     SerialBT.begin(WATCH_BLUETOOTH_NAME);
 
@@ -893,7 +910,16 @@ void loop()
 {
     switch (state)
     {
-        case WatchState::IDLE:
+        case WatchState::BOOTING:
+        {
+            state = resumeSessionOnBoot
+                ? WatchState::RESUME_PENDING_TIME_SYNC
+                : WatchState::IDLE_UNSYNCED;
+            break;
+        }
+
+        case WatchState::IDLE_UNSYNCED:
+        case WatchState::IDLE_READY:
         {
             updateSessionCount();
 
@@ -915,7 +941,8 @@ void loop()
             int16_t startTouchX = 0;
             int16_t startTouchY = 0;
 
-            while (!exitIdleScreen)
+            while (!exitIdleScreen &&
+                   (state == WatchState::IDLE_UNSYNCED || state == WatchState::IDLE_READY))
             {
                 drawClockBanner();
                 pollBluetooth();
@@ -926,7 +953,7 @@ void loop()
                     if (storedSessionCount >= MAX_SESSIONS) {
                         showMemoryFullMessage();
                         exitIdleScreen = true;
-                    } else if (!clockSynced) {
+                    } else if (!isClockCurrentlyValid()) {
                         showClockNotSyncedMessage();
                         exitIdleScreen = true;
                     } else {
@@ -945,7 +972,7 @@ void loop()
                         if (storedSessionCount >= MAX_SESSIONS) {
                             showMemoryFullMessage();
                             exitIdleScreen = true;
-                        } else if (!clockSynced) {
+                        } else if (!isClockCurrentlyValid()) {
                             showClockNotSyncedMessage();
                             exitIdleScreen = true;
                         } else {
@@ -953,6 +980,7 @@ void loop()
                             exitIdleScreen = true;
                         }
                     }
+
                     watch->power->clearIRQ();
                 }
 
@@ -961,13 +989,7 @@ void loop()
             break;
         }
 
-        case WatchState::SESSION_STARTING:
-        {
-            beginNewSession();
-            break;
-        }
-
-        case WatchState::RESUME_NEEDS_TIME_SYNC:
+        case WatchState::RESUME_PENDING_TIME_SYNC:
         {
             watch->tft->fillScreen(TFT_BLACK);
             watch->tft->setTextFont(4);
@@ -980,7 +1002,7 @@ void loop()
             watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
             watch->tft->drawString("Connect to RPi", 40, 145, 2);
 
-            while (state == WatchState::RESUME_NEEDS_TIME_SYNC)
+            while (state == WatchState::RESUME_PENDING_TIME_SYNC)
             {
                 drawClockBanner();
                 pollBluetooth();
@@ -996,6 +1018,13 @@ void loop()
             break;
         }
 
+        case WatchState::SESSION_STARTING:
+        {
+            beginNewSession();
+            state = WatchState::SESSION_ACTIVE;
+            break;
+        }
+
         case WatchState::SESSION_ACTIVE:
         {
             watch->tft->setTextFont(4);
@@ -1003,13 +1032,12 @@ void loop()
             watch->tft->setTextColor(TFT_WHITE, TFT_BLACK);
             watch->tft->fillScreen(TFT_BLACK);
 
+            drawClockBanner(true);
             if (resumeSessionOnBoot) {
-                drawClockBanner(true);
                 watch->tft->drawString("Resuming hike", 45, 100);
                 delay(1000);
                 resumeSessionOnBoot = false;
             } else {
-                drawClockBanner(true);
                 watch->tft->drawString("Starting hike", 45, 100);
                 delay(1000);
             }
@@ -1068,7 +1096,7 @@ void loop()
                 pollBluetooth();
 
                 if (touchButtonReleased(END_TOUCH_BUTTON, endTouchActive, endTouchX, endTouchY)) {
-                    finalizeSession();
+                    state = WatchState::SESSION_ENDING;
                     break;
                 }
 
@@ -1077,7 +1105,7 @@ void loop()
                     watch->power->readIRQ();
 
                     if (watch->power->isPEKShortPressIRQ()) {
-                        finalizeSession();
+                        state = WatchState::SESSION_ENDING;
                         watch->power->clearIRQ();
                         break;
                     }
@@ -1088,6 +1116,23 @@ void loop()
                 delay(30);
             }
 
+            break;
+        }
+
+        case WatchState::SESSION_ENDING:
+        {
+            finalizeSession();
+            state = WatchState::SESSION_SAVED;
+            break;
+        }
+
+        case WatchState::SESSION_SAVED:
+        {
+            watch->tft->fillScreen(TFT_BLACK);
+            drawClockBanner(true);
+            watch->tft->drawString("Session saved", 45, 100, 4);
+            delay(1000);
+            transitionToIdleState();
             break;
         }
     }
